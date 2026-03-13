@@ -1,0 +1,36 @@
+FROM php:8.4-fpm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpng-dev \
+    libjpeg62-turbo-dev \
+    libfreetype6-dev \
+    libzip-dev \
+    libicu-dev \
+    libonig-dev \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) \
+        mysqli \
+        pdo_mysql \
+        gd \
+        zip \
+        intl \
+        mbstring \
+        opcache \
+        exif \
+    && rm -rf /var/lib/apt/lists/*
+
+# PHP config for WordPress
+RUN { \
+    echo 'upload_max_filesize = 64M'; \
+    echo 'post_max_size = 64M'; \
+    echo 'memory_limit = 256M'; \
+    echo 'max_execution_time = 300'; \
+    echo 'max_input_vars = 3000'; \
+} > /usr/local/etc/php/conf.d/wordpress.ini
+
+# Entrypoint: fix ownership so WP can write (updates, plugins, uploads)
+RUN echo '#!/bin/sh\nchown -R www-data:www-data /var/www/html 2>/dev/null\nexec "$@"' > /entrypoint.sh \
+    && chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["php-fpm"]

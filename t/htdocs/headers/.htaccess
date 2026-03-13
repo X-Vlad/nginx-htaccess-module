@@ -1,0 +1,21 @@
+# Header set
+Header set X-Custom-Header "test-value"
+Header set X-Powered-By "htaccess-module"
+
+# Header append
+Header append X-Multi "value1"
+
+# Header unset
+Header unset Server
+
+# ForceType for .json
+<Files "test.json">
+ForceType application/json
+</Files>
+
+# AddType
+AddType text/css .css
+AddType application/javascript .js
+
+# AddDefaultCharset
+AddDefaultCharset UTF-8

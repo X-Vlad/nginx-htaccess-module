@@ -1,0 +1,14 @@
+# Block access to .txt files
+<Files "secret.txt">
+Require all denied
+</Files>
+
+# Add header to XML files
+<FilesMatch "\.xml$">
+Header set X-File-Type "xml-matched"
+</FilesMatch>
+
+# Public access to public.txt
+<Files "public.txt">
+Require all granted
+</Files>

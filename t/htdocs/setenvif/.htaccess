@@ -1,0 +1,2 @@
+SetEnvIf User-Agent "TestBot" IS_BOT=1
+SetEnvIf Request_URI "\.html$" IS_HTML=1

@@ -1,0 +1,49 @@
+# MODX supports Friendly URLs via this .htaccess file. You must serve web
+# pages via Apache with mod_rewrite to use this feature, and you must change
+# the file name from ht.access to .htaccess.
+
+RewriteEngine On
+RewriteBase /cms/modx/
+
+# Rewrite www.domain.com -> domain.com -- used with SEO Strict URLs plugin
+#RewriteCond %{HTTP_HOST} .
+#RewriteCond %{HTTP_HOST} !^example-domain-please-change\.com [NC]
+#RewriteRule (.*) https://example-domain-please-change.com/$1 [R=301,L]
+
+# or for the opposite domain.com -> www.domain.com use the following
+#RewriteCond %{HTTP_HOST} .
+#RewriteCond %{HTTP_HOST} !^www\.example-domain-please-change\.com [NC]
+#RewriteRule (.*) https://www.example-domain-please-change.com/$1 [R=301,L]
+
+# Rewrite secure requests properly to prevent SSL cert warnings, e.g. prevent
+# https://www.domain.com when cert only allows https://secure.domain.com
+#RewriteCond %{SERVER_PORT} !^443
+#RewriteRule (.*) https://example-domain-please-change.com/$1 [R=301,L]
+
+# The Friendly URLs part
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ index.php?q=$1 [L,QSA]
+
+# Make sure .htc files are served with the proper MIME type, which is critical
+# for XP IE to properly handle htc files.
+AddType text/x-component .htc
+
+# If your server is not already configured as such, the following directive
+# should be uncommented in order to set PHP's register_globals option to OFF.
+# This closes a major security hole that is abused by most XSS (cross-site
+# scripting) attacks.
+#php_flag register_globals Off
+
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+</IfModule>
+
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/css "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+    ExpiresByType image/jpeg "access plus 1 year"
+    ExpiresByType image/png "access plus 1 year"
+    ExpiresByType image/gif "access plus 1 year"
+</IfModule>

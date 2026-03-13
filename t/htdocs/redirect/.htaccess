@@ -1,0 +1,19 @@
+RewriteEngine On
+
+# Simple Redirect 301
+Redirect 301 /redirect/old-page /redirect/target.html
+
+# Redirect 302
+Redirect 302 /redirect/temp-page /redirect/target.html
+
+# RedirectPermanent
+RedirectPermanent /redirect/perm-page /redirect/target.html
+
+# RedirectTemp
+RedirectTemp /redirect/temp-page2 /redirect/target.html
+
+# Redirect gone (410)
+Redirect gone /redirect/deleted-page
+
+# RedirectMatch with backreference
+RedirectMatch 301 ^/redirect/article/([0-9]+)$ /redirect/target.html?id=$1

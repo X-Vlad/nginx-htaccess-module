@@ -1,0 +1,55 @@
+RewriteEngine On
+
+# Basic rewrite
+RewriteRule ^simple$ /rewrite/target.html [L]
+
+# Rewrite with backreference
+RewriteRule ^page/([0-9]+)$ /rewrite/page.html?id=$1 [L,QSA]
+
+# Case-insensitive rewrite
+RewriteRule ^UPPER$ /rewrite/target.html [NC,L]
+
+# Redirect 301
+RewriteRule ^old-url$ /rewrite/target.html [R=301,L]
+
+# Redirect 302
+RewriteRule ^temp-url$ /rewrite/target.html [R=302,L]
+
+# Forbidden
+RewriteRule ^forbidden$ - [F]
+
+# Gone
+RewriteRule ^gone$ - [G]
+
+# QSA flag
+RewriteRule ^qsa-test$ /rewrite/target.html?extra=1 [QSA,L]
+
+# QSD flag
+RewriteRule ^qsd-test$ /rewrite/target.html [QSD,L]
+
+# RewriteCond on HTTP_HOST
+RewriteCond %{HTTP_HOST} ^test\.example\.com$
+RewriteRule ^cond-host$ /rewrite/target.html [R=302,L]
+
+# RewriteCond on REQUEST_URI
+RewriteCond %{REQUEST_URI} ^/rewrite/cond-uri
+RewriteRule .* /rewrite/target.html [L]
+
+# RewriteCond negation
+RewriteCond %{REQUEST_URI} !^/rewrite/target
+RewriteRule ^negate-test$ /rewrite/target.html [L]
+
+# RewriteCond -f (file exists)
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.+)$ /rewrite/target.html [L]
+
+# Chain flag
+RewriteRule ^chain-start$ /rewrite/chain-mid [C]
+RewriteRule ^chain-mid$ /rewrite/target.html [L]
+
+# ENV flag
+RewriteRule ^env-test$ /rewrite/target.html [E=TEST_VAR:hello,L]
+
+# RewriteBase
+RewriteBase /rewrite/

@@ -1,0 +1,120 @@
+############################################
+## Magento 2 .htaccess
+
+<IfModule mod_rewrite.c>
+
+############################################
+## enable rewrites
+
+    Options +FollowSymLinks
+    RewriteEngine on
+
+############################################
+## you can put here your magento root folder
+## path relative to web root
+
+    #RewriteBase /magento/
+
+############################################
+## workaround for HTTP authorization
+## in CGI environment
+
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+############################################
+## TRACE and TRACK HTTP methods disabled to prevent XSS attacks
+
+    RewriteCond %{REQUEST_METHOD} ^TRAC[EK]
+    RewriteRule .* - [L,R=405]
+
+############################################
+## redirect for mobile user agents
+
+    #RewriteCond %{HTTP_USER_AGENT} "android|blackberry|ipad|iphone|ipod|iemobile|opera mobile|palmos|webos|googlebot-mobile" [NC]
+    #RewriteRule ^(.*)$ /mobile/$1 [R,L]
+
+############################################
+## never rewrite for existing files, directories and links
+
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-l
+    RewriteRule .* index.php [L]
+
+</IfModule>
+
+############################################
+## Prevent character encoding issues from server overrides
+
+    AddDefaultCharset Off
+
+############################################
+## Add default Vary header
+
+<IfModule mod_headers.c>
+    Header append Vary User-Agent env=!dont-vary
+</IfModule>
+
+############################################
+## If running in cluster environment, uncomment this
+## http://developer.yahoo.com/performance/rules.html#etags
+
+    #FileETag none
+
+############################################
+## Deny access to release notes to prevent disclosure of the installed Magento version
+
+<Files RELEASE_NOTES.txt>
+    Order allow,deny
+    Deny from all
+</Files>
+
+############################################
+## by default allow all access
+
+    Order allow,deny
+    Allow from all
+
+############################################
+## Deny access to cron.php
+
+<Files cron.php>
+    Order allow,deny
+    Deny from all
+</Files>
+
+############################################
+## Extra expires caching
+
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresDefault "access plus 1 year"
+    ExpiresByType text/html "access plus 0 seconds"
+    ExpiresByType text/xml "access plus 0 seconds"
+    ExpiresByType application/json "access plus 0 seconds"
+    ExpiresByType application/pdf "access plus 1 month"
+    ExpiresByType image/x-icon "access plus 1 year"
+    ExpiresByType image/gif "access plus 1 month"
+    ExpiresByType image/png "access plus 1 month"
+    ExpiresByType image/jpeg "access plus 1 month"
+    ExpiresByType image/svg+xml "access plus 1 month"
+    ExpiresByType text/css "access plus 1 month"
+    ExpiresByType text/javascript "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+    ExpiresByType application/x-font-ttf "access plus 1 month"
+    ExpiresByType application/x-font-woff "access plus 1 month"
+    ExpiresByType font/opentype "access plus 1 month"
+    ExpiresByType font/woff2 "access plus 1 month"
+</IfModule>
+
+############################################
+## Set environment variable for compatibility
+
+<IfModule mod_env.c>
+    SetEnvIf Request_URI "\.(?:gif|jpe?g|png|ico|css|js|svg|woff2?)$" IS_STATIC=1
+</IfModule>
+
+############################################
+## Disable ETags
+
+    FileETag none

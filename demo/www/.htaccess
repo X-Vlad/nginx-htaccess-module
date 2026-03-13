@@ -1,0 +1,38 @@
+RewriteEngine On
+
+# Block sensitive files BEFORE catch-all rewrite
+# (Files/FilesMatch only works if the file exists on disk)
+RewriteRule ^\.env$ - [F,L]
+RewriteRule ^\.git - [F,L]
+RewriteRule \.(sql|log|bak)$ - [F,L]
+
+# Pretty URLs - like WordPress/Laravel
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ /index.php?route=$1 [QSA,L]
+
+# Custom headers
+Header set X-Powered-By "nginx-htaccess-module"
+Header set X-Test-Header "it-works"
+
+# Expires
+ExpiresActive On
+ExpiresDefault "access plus 1 hours"
+ExpiresByType text/css "access plus 1 months"
+ExpiresByType application/javascript "access plus 1 weeks"
+ExpiresByType image/jpeg "access plus 1 years"
+
+# Charset
+AddDefaultCharset UTF-8
+
+# Directory index
+DirectoryIndex index.php index.html
+
+# Block sensitive files (for files that exist on disk)
+<Files ".env">
+    Require all denied
+</Files>
+
+<FilesMatch "\.(sql|log|bak)$">
+    Require all denied
+</FilesMatch>

@@ -1,0 +1,63 @@
+# Hidden directories (IDE, tools, etc.) - except .github
+.*
+!.github/
+!.gitignore
+!.htaccess
+!.htpasswd
+
+# Build artifacts
+*.o
+*.so
+*.a
+*.la
+*.lo
+*.dylib
+*.dSYM/
+objs/
+
+# nginx build artifacts (not our root Makefile)
+config.log
+config.status
+
+# Editor files
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.kate-swp
+\#*\#
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+compile_commands.json
+.ccls-cache/
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Debian/RPM packaging artifacts
+*.deb
+*.rpm
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+debian/files
+debian/*.debhelper*
+debian/*.substvars
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Demo - CMS installations (heavy, local-only)
+demo/www/wordpress/
+demo/www/joomla/
+demo/www/drupal/
+demo/www/laravel/

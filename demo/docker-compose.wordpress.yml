@@ -1,0 +1,35 @@
+services:
+  nginx:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.wordpress
+    ports:
+      - "8080:80"
+    volumes:
+      - ./www/wordpress:/var/www/html
+    depends_on:
+      - php
+
+  php:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.php-wp
+    volumes:
+      - ./www/wordpress:/var/www/html
+    depends_on:
+      - mysql
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wp
+      MYSQL_PASSWORD: wppass
+    volumes:
+      - wp_mysql_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+
+volumes:
+  wp_mysql_data:

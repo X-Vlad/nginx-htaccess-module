@@ -1,0 +1,50 @@
+DirectoryIndex index.php index.html
+AddDefaultCharset utf-8
+
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase /cms/dle/
+
+# DLE rewrite rules
+RewriteRule ^page/(.*)$ index.php?cstart=$1 [L]
+
+# Category
+RewriteRule ^([0-9]+)-(.+)\.html$ index.php?newsid=$1 [L]
+
+# Tags
+RewriteRule ^tags/(.+)/page/([0-9]+)/$ index.php?do=tags&tag=$1&cstart=$2 [L,QSA]
+RewriteRule ^tags/(.+)/$ index.php?do=tags&tag=$1 [L,QSA]
+RewriteRule ^tags/(.+)$ index.php?do=tags&tag=$1 [L,QSA]
+
+# User profile
+RewriteRule ^user/(.+)/$ index.php?subaction=userinfo&user=$1 [L]
+
+# Static pages
+RewriteRule ^(.+)/page/([0-9]+)/$ index.php?do=cat&category=$1&cstart=$2 [L]
+RewriteRule ^(.+)/$ index.php?do=cat&category=$1 [L]
+
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^(.+)$ index.php?do=cat&category=$1 [L]
+</IfModule>
+
+# Deny access to engine templates
+<FilesMatch "\.(tpl|xml|log)$">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>
+
+<IfModule mod_expires.c>
+ExpiresActive On
+ExpiresDefault "access plus 5 seconds"
+ExpiresByType image/x-icon "access plus 2592000 seconds"
+ExpiresByType image/jpeg "access plus 2592000 seconds"
+ExpiresByType image/png "access plus 2592000 seconds"
+ExpiresByType image/gif "access plus 2592000 seconds"
+ExpiresByType text/css "access plus 604800 seconds"
+ExpiresByType text/javascript "access plus 604800 seconds"
+ExpiresByType application/javascript "access plus 604800 seconds"
+</IfModule>
+
+php_value upload_max_filesize 50M
+php_value post_max_size 50M

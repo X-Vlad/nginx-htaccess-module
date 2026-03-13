@@ -1,0 +1,126 @@
+FROM ubuntu:24.04
+
+ARG NGINX_VERSION=1.28.2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpcre2-dev \
+    libpcre3-dev \
+    zlib1g-dev \
+    libssl-dev \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and extract nginx source
+RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
+    && tar xzf nginx-${NGINX_VERSION}.tar.gz \
+    && rm nginx-${NGINX_VERSION}.tar.gz
+
+# Copy module source
+COPY *.c *.h config /module/
+
+# Build nginx with module
+RUN cd /nginx-${NGINX_VERSION} \
+    && ./configure \
+        --with-compat \
+        --with-http_ssl_module \
+        --with-http_realip_module \
+        --add-dynamic-module=/module \
+    && make -j$(nproc) modules \
+    && make -j$(nproc) \
+    && make install
+
+# Install module
+RUN mkdir -p /usr/local/nginx/modules \
+    && cp /nginx-${NGINX_VERSION}/objs/ngx_http_htaccess_module.so /usr/local/nginx/modules/
+
+# Create nginx config for PHP-FPM
+RUN cat > /usr/local/nginx/conf/nginx.conf << 'EOF'
+load_module modules/ngx_http_htaccess_module.so;
+
+worker_processes auto;
+error_log /dev/stderr info;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    access_log /dev/stdout;
+
+    sendfile off;
+    keepalive_timeout 0;
+    client_max_body_size 64m;
+
+    # Gzip compression
+    gzip on;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_proxied any;
+    gzip_vary on;
+    gzip_disable "msie6";
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/json
+        application/javascript
+        application/x-javascript
+        application/xml
+        application/xml+rss
+        application/atom+xml
+        image/svg+xml;
+
+    server {
+        listen 80;
+        server_name localhost;
+        root /var/www/html;
+        index index.php index.html;
+        charset UTF-8;
+
+        # Security headers
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+
+        # htaccess handles rewrites, DirectoryIndex, access control
+        location / {
+            htaccess on;
+        }
+
+        # Static files - caching & direct serve
+        location ~* ^.+\.(jpg|jpeg|gif|png|webp|svg|ico|js|css|mp3|ogg|mpe?g|avi|zip|gz|bz2?|rar|swf|woff|woff2|ttf|eot)$ {
+            expires 365d;
+            access_log off;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # Block hidden files (.htaccess, .git, etc.)
+        location ~ /\. {
+            deny all;
+            return 404;
+        }
+
+        # PHP-FPM handler
+        location ~ \.php$ {
+            fastcgi_pass php:9000;
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            include fastcgi_params;
+            fastcgi_read_timeout 300;
+        }
+    }
+}
+EOF
+
+# Copy demo site into image (avoids Docker volume 9P slowness on Windows)
+COPY demo/www/index.php demo/www/phpinfo.php demo/www/.htaccess /var/www/html/
+
+EXPOSE 80
+
+CMD ["/usr/local/nginx/sbin/nginx", "-g", "daemon off;"]

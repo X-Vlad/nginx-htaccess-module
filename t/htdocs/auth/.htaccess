@@ -1,0 +1,4 @@
+AuthType Basic
+AuthName "Test Realm"
+AuthUserFile __HTDOCS_ROOT__/auth/.htpasswd
+Require valid-user

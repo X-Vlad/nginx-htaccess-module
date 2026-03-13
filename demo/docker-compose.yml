@@ -1,0 +1,14 @@
+services:
+  nginx:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.demo
+    ports:
+      - "8080:80"
+    depends_on:
+      - php
+
+  php:
+    image: php:8.4-fpm
+    volumes:
+      - ./www:/var/www/html
