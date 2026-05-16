@@ -1,0 +1,5 @@
+php_value       upload_max_filesize 64M
+php_value       post_max_size       128M
+php_flag        display_errors      off
+php_admin_value memory_limit        256M
+php_admin_flag  log_errors          on

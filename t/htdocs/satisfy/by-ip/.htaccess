@@ -1,0 +1,12 @@
+# Satisfy Any: pass if either auth OR localhost
+AuthType Basic
+AuthName "Restricted"
+AuthUserFile __HTDOCS_ROOT__/auth/.htpasswd
+Require valid-user
+
+Order Deny,Allow
+Deny from all
+Allow from 127.0.0.1
+Allow from ::1
+
+Satisfy Any

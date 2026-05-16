@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     wget \
     curl \
+    apache2-utils \
+    xxd \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -39,13 +41,29 @@ RUN mkdir -p /usr/local/nginx/modules \
 # Copy test files
 COPY t/ /tests/t/
 
-# Generate htpasswd and fix paths
+# Generate htpasswd files (multiple hash formats) and fix paths
 RUN HTDOCS=/tests/t/htdocs \
     && HASH=$(openssl passwd -6 "testpass") \
     && echo "testuser:${HASH}" > "$HTDOCS/auth/.htpasswd" \
     && HASH2=$(openssl passwd -6 "otherpass") \
     && echo "otheruser:${HASH2}" >> "$HTDOCS/auth/.htpasswd" \
-    && sed -i "s|__HTDOCS_ROOT__|${HTDOCS}|g" "$HTDOCS/auth/.htaccess" \
+    # {SHA} format: base64(sha1(password)) \
+    && SHA_HASH=$(printf '%s' 'testpass' | sha1sum | awk '{print $1}' | xxd -r -p | base64) \
+    && echo "shauser:{SHA}${SHA_HASH}" > "$HTDOCS/auth-sha/.htpasswd" \
+    # $apr1$ format: Apache MD5 (htpasswd -m) \
+    && htpasswd -bcm "$HTDOCS/auth-apr1/.htpasswd" apruser testpass \
+    # .htgroup file: groups for Require group tests \
+    && printf 'admins: testuser\nusers: testuser otheruser\nempty:\n' > "$HTDOCS/groups/.htgroup" \
+    # apply __HTDOCS_ROOT__ substitution \
+    && for f in "$HTDOCS/auth/.htaccess" \
+                "$HTDOCS/limit/post-auth/.htaccess" \
+                "$HTDOCS/satisfy/by-ip/.htaccess" \
+                "$HTDOCS/satisfy/strict/.htaccess" \
+                "$HTDOCS/auth-sha/.htaccess" \
+                "$HTDOCS/auth-apr1/.htaccess" \
+                "$HTDOCS/groups/.htaccess"; do \
+        [ -f "$f" ] && sed -i "s|__HTDOCS_ROOT__|${HTDOCS}|g" "$f"; \
+    done \
     && chmod +x /tests/t/run_tests.sh /tests/t/helpers.sh /tests/t/*.t.sh
 
 WORKDIR /tests

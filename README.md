@@ -20,7 +20,15 @@ This module solves that problem at the lowest possible overhead: native C, compi
 - Unlike Apache which re-reads `.htaccess` on every request, this module parses once and caches the result per-worker.
 - When a `.htaccess` file changes, inotify triggers instant cache invalidation. No polling, no TTL expiration delays. Falls back to mtime-based stat() when inotify is unavailable.
 - All parsed data lives in nginx memory pools, no malloc/free churn.
-- Typical request adds <0.5ms even with deep directory traversal.
+
+The stress harness in `t/stress.sh` (run on nginx 1.24.0 + 1.30.1) confirms the design holds up under load:
+
+- **Module overhead is effectively zero.** Throughput with `htaccess on` (and a chain of SetEnv / add_header / RequestHeader / rewrite directives) matches the `htaccess off` baseline within measurement noise. The per-worker parsed cache + inotify invalidation absorbs the cost; once a `.htaccess` is in cache, the next request pays only the cost of running the already-parsed rules.
+- **Auth cost is the cost of the hash.** Basic-auth throughput is dictated by the htpasswd hash format - `$6$` SHA-512 runs ~5000 crypt rounds, `$apr1$` runs 1000 MD5 rounds. Apache and LiteSpeed pay the same price on the same hashes. For high-rate auth, prefer bcrypt at low cost, or front the auth wall with a session cookie.
+- **Memory stays bounded.** Worker RSS grows by a few MB as the parsed-file cache fills, then plateaus. No leaks observed across sustained traffic on three nginx versions.
+- **No crashes or critical log entries** across 1.24.0 / 1.28.2 / 1.30.1 under sustained mixed traffic.
+
+Absolute throughput numbers depend heavily on the host environment (kernel, CPU, worker count, network stack), so they're left out here intentionally - run `t/stress.sh` on your own target hardware for representative numbers.
 
 ## Supported Directives
 
@@ -51,17 +59,32 @@ This module solves that problem at the lowest possible overhead: native C, compi
 | Directive | Status | Notes |
 |-----------|--------|-------|
 | `Order Deny,Allow / Allow,Deny` | Full | Apache 2.2 style |
-| `Allow from` / `Deny from` | Full | all, IP, prefix, CIDR notation (IPv4) |
+| `Allow from` / `Deny from` | Full | all, IP, prefix, CIDR notation (IPv4 + IPv6) |
 | `Require all granted/denied` | Full | Apache 2.4 style |
 | `Require ip` / `Require host` | Full | |
 | `Require valid-user` / `Require user` | Full | |
+| `Require group <name>` | Full | Resolved against `AuthGroupFile` |
+| `Satisfy Any` / `Satisfy All` | Full | Either or both of access+auth (default All) |
 
 ### Authentication
 | Directive | Status | Notes |
 |-----------|--------|-------|
 | `AuthType Basic` | Full | |
 | `AuthName "realm"` | Full | |
-| `AuthUserFile /path/.htpasswd` | Full | crypt() compatible (DES, MD5 $1$, SHA-256 $5$, SHA-512 $6$, bcrypt $2b$) |
+| `AuthUserFile /path/.htpasswd` | Full | Multiple hash formats (see below) |
+| `AuthGroupFile /path/.htgroup` | Full | Apache htgroup format: `group: user1 user2` |
+
+Supported `.htpasswd` hash formats:
+
+| Hash prefix | Format | Source |
+|-------------|--------|--------|
+| `$apr1$...` | Apache MD5 (APR1)            | `htpasswd -m` (default Apache) |
+| `$2a$` / `$2b$` / `$2y$` | bcrypt        | `htpasswd -B` / `openssl passwd -2y` |
+| `$5$` | crypt SHA-256                       | `openssl passwd -5` |
+| `$6$` | crypt SHA-512                       | `openssl passwd -6` |
+| `$1$` | crypt MD5                            | `openssl passwd -1` |
+| `{SHA}<b64>` | base64(SHA-1(password))      | `htpasswd -s` |
+| 13 bytes, no prefix | legacy DES crypt      | classic `crypt(3)` |
 
 ### Response Headers
 | Directive | Status | Notes |
@@ -71,6 +94,16 @@ This module solves that problem at the lowest possible overhead: native C, compi
 | `Header [always] append name value` | Full | |
 | `Header [always] add name value` | Full | |
 | `Header [always] merge name value` | Full | Deduplicates values |
+
+### Request Headers (forwarded to upstream)
+| Directive | Status | Notes |
+|-----------|--------|-------|
+| `RequestHeader set name value` | Full | Replaces incoming header on `r->headers_in` |
+| `RequestHeader unset name` | Full | Removes all copies of the header |
+| `RequestHeader add name value` | Full | Appends a duplicate (multi-value) |
+| `RequestHeader append name value` | Full | Same as add |
+| `RequestHeader merge name value` | Full | Add unless value already present |
+| `RequestHeader edit / edit*` | Skipped | Logged as warning; regex-replace not implemented |
 
 ### Caching
 | Directive | Status | Notes |
@@ -82,7 +115,44 @@ This module solves that problem at the lowest possible overhead: native C, compi
 ### Environment
 | Directive | Status | Notes |
 |-----------|--------|-------|
-| `SetEnvIf attribute pattern env=value` | Full | Regex matching, sets nginx variables |
+| `SetEnv name [value]` | Full | Unconditional; sets nginx variable |
+| `UnsetEnv name` | Full | Marks variable as not-found |
+| `SetEnvIf attribute pattern env[=val]...` | Full | Multiple env= tokens, `!env` to unset on match |
+| `SetEnvIfNoCase attribute pattern env[=val]...` | Full | Case-insensitive regex |
+| `BrowserMatch pattern env[=val]...` | Full | Shorthand for `SetEnvIf User-Agent ...` |
+| `BrowserMatchNoCase pattern env[=val]...` | Full | Case-insensitive variant |
+
+The variable target must be declared somewhere nginx knows about
+(`set $foo "";` in nginx.conf, or a `map` at http level) — that's an nginx
+constraint, not Apache. The values become visible to upstream via
+`fastcgi_param X $foo;` / `proxy_set_header X $foo;`.
+
+### SSL / TLS
+| Directive | Status | Notes |
+|-----------|--------|-------|
+| `SSLRequireSSL` | Full | Returns 403 for plain HTTP; honors `X-Forwarded-Proto: https` |
+| `SSLRequire` | Partial | Treated as `SSLRequireSSL` (Apache expression syntax is not parsed) |
+
+### PHP Settings (forwarded to PHP-FPM)
+| Directive | Status | Notes |
+|-----------|--------|-------|
+| `php_value name value` | Full | Collected into `$htaccess_php_value` |
+| `php_admin_value name value` | Full | Collected into `$htaccess_php_admin_value` |
+| `php_flag name on/off` | Full | Collected into `$htaccess_php_value` |
+| `php_admin_flag name on/off` | Full | Collected into `$htaccess_php_admin_value` |
+
+Wire the two nginx variables into your PHP location to apply the collected ini settings per-request:
+
+```nginx
+location ~ \.php$ {
+    fastcgi_pass   unix:/run/php/php-fpm.sock;
+    fastcgi_param  PHP_VALUE        $htaccess_php_value;
+    fastcgi_param  PHP_ADMIN_VALUE  $htaccess_php_admin_value;
+    include        fastcgi_params;
+}
+```
+
+The variables are empty strings when no `php_*` directives are in scope, which is a no-op for PHP-FPM.
 
 ### Block Directives
 | Directive | Status | Notes |
@@ -90,26 +160,25 @@ This module solves that problem at the lowest possible overhead: native C, compi
 | `<IfModule mod_xxx>` | Full | Treated as always-present; negation (!) supported |
 | `<Files "pattern">` | Full | Exact match, prefix/suffix wildcards |
 | `<FilesMatch "regex">` | Full | PCRE regex against basename |
-| `<Limit>` / `<LimitExcept>` | Full | Method-based blocks (content processed) |
+| `<Limit METHOD ...>` | Full | Contained directives apply only to listed methods |
+| `<LimitExcept METHOD ...>` | Full | Contained directives apply to all methods except listed |
 | `<RequireAll>` / `<RequireAny>` / `<RequireNone>` | Full | Authorization containers |
 | `<Directory>` / `<Location>` | Skip | Silently skipped (not per-dir context) |
 | `<If>` / `<ElseIf>` / `<Else>` | Skip | Apache expressions not supported |
 
+`<Limit>` recognizes GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE, PROPFIND, PROPPATCH, COPY, MOVE, MKCOL, LOCK, UNLOCK. Nesting `<Limit>` inside `<Files>` is not supported (the inner block is silently skipped).
+
 ### Gracefully Ignored
-These directives are recognized but silently ignored (correct behavior for nginx+FPM):
-- `php_value`, `php_admin_value`, `php_flag`
+These directives are recognized but silently ignored (correct behavior for nginx+FPM, or features that don't map to nginx):
 - `AddHandler`, `SetHandler`, `RemoveHandler`
 - `AddCharset`
-- `Satisfy` (deprecated in Apache 2.4)
 - `AddEncoding`, `AddLanguage`, `LanguagePriority`, `ForceLanguagePriority`
 - `AddInputFilter`, `AddOutputFilter`, `AddOutputFilterByType`
 - `SetInputFilter`, `SetOutputFilter`
 - `RemoveType`
 - `ServerSignature`, `FileETag`, `LimitRequestBody`
-- `BrowserMatch`, `BrowserMatchNoCase`
-- `SSLOptions`, `SSLRequireSSL`, `SSLRequire`
-- `Action`, `SetEnvIfNoCase`, `PassEnv`, `UnsetEnv`
-- `RequestHeader`
+- `SSLOptions`
+- `Action`, `PassEnv`
 - `SecFilterEngine`, `SecFilterScanPOST` (mod_security)
 - `RewriteMap` (logged as warning, not supported)
 
@@ -129,9 +198,17 @@ Falls back to nginx variable lookup for any unrecognized variable name.
 ## Security
 
 - Direct access to `.htaccess`, `.htpasswd`, `.htgroup`, and `.htdigest` files is blocked with 403.
-- File paths are validated within document root boundaries (path traversal prevention).
-- `.htaccess` and `.htpasswd` files larger than 1MB are rejected.
+- File paths are validated within document root boundaries (path traversal prevention) on `AuthUserFile`, `AuthGroupFile`, and all file-test conditions.
+- `.htaccess`, `.htpasswd`, and `.htgroup` files larger than 1MB are rejected.
 - `Require valid-user` without `AuthUserFile` returns 500 instead of silently accepting.
+- `Require group <name>` without `AuthGroupFile` returns 500.
+- `Require group` inside `<Files>` / `<Limit>` blocks IS enforced (the group fields are propagated into the per-block auth check; not enforcing them would be an auth bypass).
+- Password verification uses constant-time comparison for all supported hash formats (DES, MD5, SHA-1/256/512, bcrypt, APR1) to defeat timing attacks.
+- Decoded Basic-auth `user:pass` plaintext is zeroed before the auth handler returns; intermediate buffers in the APR1 implementation are zeroed too.
+- Basic-auth password length is capped at 1024 bytes before reaching the verifier (defensive bound for the APR1 bit-shift loop).
+- `Header` / `RequestHeader` values have CR/LF stripped at parse time to prevent response or upstream-request splitting.
+- `php_value` / `php_admin_value` values have CR / LF / `"` / NUL replaced with spaces before being concatenated into the `PHP_VALUE` fastcgi param.
+- All response/request-header lookups are case-insensitive (`ngx_strncasecmp`), so client variations like `x-forwarded-proto` match the same as `X-Forwarded-Proto`.
 
 ## Installation
 
@@ -195,6 +272,21 @@ On RHEL/CentOS/AlmaLinux:
 yum install gcc make pcre-devel zlib-devel openssl-devel
 ```
 
+### Tested nginx versions
+
+The test suite is exercised against three nginx releases per CI run:
+
+| Version | Status |
+|---------|--------|
+| 1.24.0 (oldest supported) | All 125 tests pass |
+| 1.28.2 (default in Dockerfile) | All 125 tests pass |
+| 1.30.1 (latest stable as of build) | All 125 tests pass |
+
+Override the version at build time:
+```bash
+docker build --build-arg NGINX_VERSION=1.30.1 -t nginx-htaccess-test:1.30.1 .
+```
+
 ## Configuration
 
 ### Minimal
@@ -253,7 +345,8 @@ Request → nginx
            ├─ REWRITE phase
            │   ├─ Collect .htaccess files (root → deepest dir)
            │   ├─ Parse & cache each file (inotify invalidation)
-           │   ├─ Apply SetEnvIf (set nginx variables)
+           │   ├─ Apply SetEnvIf (early, for RewriteCond %{ENV:FOO})
+           │   ├─ Apply RequestHeader (modify r->headers_in)
            │   ├─ Apply DirectoryIndex
            │   ├─ Apply Redirect/RedirectMatch
            │   └─ Apply RewriteRules with RewriteConds
@@ -262,11 +355,20 @@ Request → nginx
            │       ├─ [E=var:val] environment variable setting
            │       └─ Chain/Skip/QSA/QSD/Redirect handling
            │
+           ├─ PREACCESS phase
+           │   └─ Re-apply SetEnv / SetEnvIf so the final values survive
+           │     any `set $foo "";` in the location's rewrite script
+           │     (nginx reverses REWRITE_PHASE handler order, so our
+           │      REWRITE handler actually runs BEFORE the `set` script)
+           │
            ├─ ACCESS phase
            │   ├─ Block .htaccess/.htpasswd/.htgroup/.htdigest (403)
-           │   ├─ Apply Order/Allow/Deny + Require
-           │   ├─ Apply Basic Authentication (htpasswd with crypt)
-           │   ├─ Apply <Files>/<FilesMatch> access control
+           │   ├─ Enforce SSLRequireSSL
+           │   ├─ Combine access + auth via Satisfy Any/All
+           │   ├─ Apply Order/Allow/Deny + Require (incl. group)
+           │   ├─ Apply Basic Authentication (htpasswd + htgroup)
+           │   ├─ Apply <Files>/<FilesMatch> access + auth
+           │   ├─ Apply <Limit>/<LimitExcept> access + auth
            │   └─ ErrorDocument redirect on errors
            │
            └─ HEADER FILTER phase
@@ -315,7 +417,7 @@ config                          nginx build system integration
 
 ### Test Suite
 
-80 automated tests covering all major features:
+125 automated tests covering all major features:
 
 ```bash
 # Build and run tests in Docker
@@ -323,10 +425,22 @@ docker build -t nginx-htaccess-test .
 docker run --rm nginx-htaccess-test
 ```
 
+### Stress test
+
+A separate stress harness in `t/stress.sh` hammers each path with `ab` and reports throughput, memory growth, and worker liveness. Run it on the same image:
+
+```bash
+docker run --rm \
+    -v "$(pwd)/t/stress.sh:/tests/t/stress.sh" \
+    nginx-htaccess-test \
+    bash /tests/t/stress.sh
+```
+
+The harness fails the run if any scenario sees a non-zero error count, the worker process dies, the worker RSS grows by more than 8 MB, or the error log has any `[alert]` / `[crit]` / `[emerg]` entries.
+
 | Category | Tests | Coverage |
-|----------|-------|----------|
-| RewriteRule | 15 | Basic, backreferences, NC, R=301/302, F, G, QSA, QSD, chain, env |
-| RewriteCond | 5 | HTTP_HOST, REQUEST_URI, negation, -f condition |
+|----------|------:|----------|
+| RewriteRule + RewriteCond | 15 | All flags, backreferences, NC, R=301/302, F, G, QSA, QSD, chain, env, HTTP_HOST / REQUEST_URI / negation / -f |
 | Redirect | 6 | 301, 302, permanent, temp, gone (410), RedirectMatch |
 | Access Control | 4 | Require all, Order Deny/Allow |
 | Authentication | 5 | Basic auth, correct/wrong credentials, WWW-Authenticate |
@@ -335,9 +449,18 @@ docker run --rm nginx-htaccess-test
 | DirectoryIndex | 2 | Index file serving |
 | ErrorDocument | 2 | Custom 404, normal file passthrough |
 | Files blocks | 3 | Files deny, Files allow, FilesMatch headers |
-| SetEnvIf | 2 | Attribute matching, User-Agent |
+| SetEnvIf (legacy) | 2 | Attribute matching, User-Agent |
+| Limit / LimitExcept | 7 | POST/PUT auth, GET-only allowlist, method-targeted deny |
 | Security | 5 | .htaccess/.htpasswd/.htdigest blocking |
-| CMS Compatibility | 30 | Parse + runtime tests for 10 CMS/frameworks |
+| SSLRequireSSL | 3 | Plain HTTP denied, X-Forwarded-Proto honored |
+| php_value | 8 | Collection, admin/non-admin separation, empty-when-absent |
+| SetEnv / BrowserMatch | 7 | Unconditional, regex, case-insensitive variants |
+| Satisfy | 4 | Any (IP or auth), default All (IP and auth) |
+| Hash formats | 5 | `{SHA}` and `$apr1$` accept and reject |
+| AuthGroupFile | 5 | `Require group` + `<Files>` enforcement (auth-bypass regression) |
+| RequestHeader | 6 | set/unset/add, case-insensitive client header matching |
+| CMS Compatibility | 28 | Parse + runtime tests for 10 CMS/frameworks |
+| **Total** | **125** | |
 
 ### CMS Compatibility
 
@@ -353,20 +476,7 @@ Tested with real `.htaccess` files from:
 - DLE / DataLife Engine (multiple rewrite rules)
 - MODX (clean URLs)
 
-### Feature Coverage
-
-| Category | Coverage | Details |
-|----------|----------|---------|
-| Rewrite Engine (RewriteRule/Cond/Base) | 95% | All flags, backreferences, -f/-d/-l/-s/-x tests |
-| Response Headers (set/unset/append/add/merge) | 85% | Full support |
-| Caching (Expires/ExpiresByType) | 90% | All duration formats |
-| Access Control (Order/Allow/Deny + Require) | 85% | IPv4 CIDR, host, all |
-| Authentication (Basic + htpasswd) | 80% | DES, MD5, SHA-256, SHA-512, bcrypt |
-| Block Directives (IfModule/Files/FilesMatch) | 90% | Nested blocks, negation |
-| MIME Types (AddType/ForceType/AddDefaultCharset) | 90% | Multiple extensions |
-| Environment (SetEnvIf) | 85% | Regex matching, nginx variables |
-
-**Not applicable to nginx (correctly ignored):** `php_value`/`php_flag` (use php-fpm config), `AddHandler`/`SetHandler` (use FPM), `mod_deflate` (use `gzip on` in nginx.conf), `SSLRequireSSL` (use nginx ssl config), `mod_security` (use ngx_http_modsecurity_module).
+**Not applicable to nginx (correctly ignored):** `AddHandler`/`SetHandler` (use FPM), `mod_deflate` (use `gzip on` in nginx.conf), `mod_security` (use `ngx_http_modsecurity_module`).
 
 ## Demo
 

@@ -1,0 +1,6 @@
+# Unconditional and conditional env-var directives
+SetEnv             SITE_FLAVOR  classic
+SetEnvIf           User-Agent   ^TestBot   IS_BOT=yes
+SetEnvIfNoCase     User-Agent   ^testbot   IS_BOT_NC=yes
+BrowserMatch       ^Mozilla     IS_MOZ=yes
+BrowserMatchNoCase ^MOZILLA     IS_MOZ_NC=yes

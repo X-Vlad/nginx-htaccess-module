@@ -1,0 +1,4 @@
+# Only GET and HEAD allowed
+<LimitExcept GET HEAD>
+    Require all denied
+</LimitExcept>

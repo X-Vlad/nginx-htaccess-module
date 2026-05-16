@@ -391,6 +391,13 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
                 fb->auth_users[fb->nauth_users].len = ngx_strlen(args[i]);
                 fb->nauth_users++;
             }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"group") == 0) {
+            ngx_uint_t i;
+            for (i = 2; i < n && fb->nrequire_groups < 8; i++) {
+                fb->require_groups[fb->nrequire_groups].data = args[i];
+                fb->require_groups[fb->nrequire_groups].len = ngx_strlen(args[i]);
+                fb->nrequire_groups++;
+            }
         } else if (ngx_strcasecmp(args[1], (u_char *)"ip") == 0 ||
                    ngx_strcasecmp(args[1], (u_char *)"host") == 0) {
             ngx_uint_t i;
@@ -402,6 +409,13 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
                 fb->nacl++;
             }
         }
+        return;
+    }
+
+    /* AuthGroupFile */
+    if (ngx_strcasecmp(args[0], (u_char *)"AuthGroupFile") == 0 && n >= 2) {
+        fb->auth_group_file.data = args[1];
+        fb->auth_group_file.len = ngx_strlen(args[1]);
         return;
     }
 
@@ -451,6 +465,7 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
         fb->auth_user_file.len = ngx_strlen(args[1]);
         return;
     }
+    /* AuthGroupFile (Files-block parser also handled at top with Require) */
 
     /* ForceType */
     if (ngx_strcasecmp(args[0], (u_char *)"ForceType") == 0 && n >= 2) {
@@ -477,6 +492,178 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
         }
         return;
     }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Parse a directive into a <Limit>/<LimitExcept> block context
+ * Only access control + auth directives are meaningful inside Limit
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void
+hta_parse_line_lb(hta_limit_block_t *lb, u_char *line, ngx_uint_t len,
+    ngx_log_t *log)
+{
+    u_char     *args[16];
+    ngx_uint_t  n;
+
+    (void) log;
+
+    while (len > 0 && (line[0] == ' ' || line[0] == '\t')) { line++; len--; }
+    while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t' ||
+                       line[len-1] == '\r' || line[len-1] == '\n'))
+    { len--; }
+    if (len == 0) return;
+    line[len] = '\0';
+    if (line[0] == '#') return;
+    if (line[0] == '<') return;
+
+    n = hta_tokenize(line, len, args, 16);
+    if (n == 0) return;
+
+    /* Order */
+    if (ngx_strcasecmp(args[0], (u_char *)"Order") == 0 && n >= 2) {
+        lb->has_acl = 1;
+        lb->access_order = (ngx_strncasecmp(args[1], (u_char *)"allow", 5) == 0)
+                           ? HTA_ORDER_ALLOW_DENY : HTA_ORDER_DENY_ALLOW;
+        return;
+    }
+
+    /* Allow / Deny */
+    if (ngx_strcasecmp(args[0], (u_char *)"Allow") == 0 ||
+        ngx_strcasecmp(args[0], (u_char *)"Deny") == 0)
+    {
+        unsigned   is_allow = (ngx_strcasecmp(args[0], (u_char *)"Allow") == 0);
+        ngx_uint_t start = 1;
+        ngx_uint_t i;
+
+        lb->has_acl = 1;
+        if (n >= 2 && ngx_strcasecmp(args[1], (u_char *)"from") == 0) start = 2;
+        for (i = start; i < n && lb->nacl < HTA_MAX_LB_ACL; i++) {
+            lb->acl[lb->nacl].value.data = args[i];
+            lb->acl[lb->nacl].value.len = ngx_strlen(args[i]);
+            lb->acl[lb->nacl].is_allow = is_allow;
+            lb->nacl++;
+        }
+        return;
+    }
+
+    /* Require */
+    if (ngx_strcasecmp(args[0], (u_char *)"Require") == 0 && n >= 2) {
+        if (ngx_strcasecmp(args[1], (u_char *)"all") == 0 && n >= 3) {
+            if (ngx_strcasecmp(args[2], (u_char *)"granted") == 0)
+                lb->require_granted = 1;
+            else if (ngx_strcasecmp(args[2], (u_char *)"denied") == 0)
+                lb->require_denied = 1;
+        } else if (ngx_strcasecmp(args[1], (u_char *)"valid-user") == 0) {
+            lb->auth_valid_user = 1;
+        } else if (ngx_strcasecmp(args[1], (u_char *)"user") == 0) {
+            ngx_uint_t i;
+            for (i = 2; i < n && lb->nauth_users < 8; i++) {
+                lb->auth_users[lb->nauth_users].data = args[i];
+                lb->auth_users[lb->nauth_users].len = ngx_strlen(args[i]);
+                lb->nauth_users++;
+            }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"group") == 0) {
+            ngx_uint_t i;
+            for (i = 2; i < n && lb->nrequire_groups < 8; i++) {
+                lb->require_groups[lb->nrequire_groups].data = args[i];
+                lb->require_groups[lb->nrequire_groups].len =
+                    ngx_strlen(args[i]);
+                lb->nrequire_groups++;
+            }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"ip") == 0 ||
+                   ngx_strcasecmp(args[1], (u_char *)"host") == 0) {
+            ngx_uint_t i;
+            lb->has_acl = 1;
+            for (i = 2; i < n && lb->nacl < HTA_MAX_LB_ACL; i++) {
+                lb->acl[lb->nacl].value.data = args[i];
+                lb->acl[lb->nacl].value.len = ngx_strlen(args[i]);
+                lb->acl[lb->nacl].is_allow = 1;
+                lb->nacl++;
+            }
+        }
+        return;
+    }
+
+    /* AuthType / AuthName / AuthUserFile / AuthGroupFile */
+    if (ngx_strcasecmp(args[0], (u_char *)"AuthType") == 0 && n >= 2) {
+        lb->auth_basic = (ngx_strcasecmp(args[1], (u_char *)"Basic") == 0);
+        return;
+    }
+    if (ngx_strcasecmp(args[0], (u_char *)"AuthName") == 0 && n >= 2) {
+        lb->auth_name.data = args[1]; lb->auth_name.len = ngx_strlen(args[1]);
+        return;
+    }
+    if (ngx_strcasecmp(args[0], (u_char *)"AuthUserFile") == 0 && n >= 2) {
+        lb->auth_user_file.data = args[1];
+        lb->auth_user_file.len = ngx_strlen(args[1]);
+        return;
+    }
+    if (ngx_strcasecmp(args[0], (u_char *)"AuthGroupFile") == 0 && n >= 2) {
+        lb->auth_group_file.data = args[1];
+        lb->auth_group_file.len = ngx_strlen(args[1]);
+        return;
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Parse the method list from <Limit METHOD ...> or <LimitExcept METHOD ...>
+ * Returns a bitmask of NGX_HTTP_* method constants; 0 = invalid/empty.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_uint_t
+hta_parse_methods(u_char *p, u_char *pend)
+{
+    ngx_uint_t m = 0;
+
+    while (p < pend) {
+        u_char    *start;
+        ngx_uint_t mlen;
+
+        while (p < pend && (*p == ' ' || *p == '\t' || *p == '"'
+                            || *p == '\'')) p++;
+        if (p >= pend) break;
+        start = p;
+        while (p < pend && *p != ' ' && *p != '\t' && *p != '>'
+               && *p != '"' && *p != '\'') p++;
+        mlen = p - start;
+        if (mlen == 0) break;
+
+        if      (mlen == 3 && ngx_strncasecmp(start, (u_char *)"GET", 3) == 0)
+            m |= NGX_HTTP_GET;
+        else if (mlen == 4 && ngx_strncasecmp(start, (u_char *)"POST", 4) == 0)
+            m |= NGX_HTTP_POST;
+        else if (mlen == 3 && ngx_strncasecmp(start, (u_char *)"PUT", 3) == 0)
+            m |= NGX_HTTP_PUT;
+        else if (mlen == 6 && ngx_strncasecmp(start, (u_char *)"DELETE", 6) == 0)
+            m |= NGX_HTTP_DELETE;
+        else if (mlen == 4 && ngx_strncasecmp(start, (u_char *)"HEAD", 4) == 0)
+            m |= NGX_HTTP_HEAD;
+        else if (mlen == 7 && ngx_strncasecmp(start, (u_char *)"OPTIONS", 7) == 0)
+            m |= NGX_HTTP_OPTIONS;
+        else if (mlen == 5 && ngx_strncasecmp(start, (u_char *)"PATCH", 5) == 0)
+            m |= NGX_HTTP_PATCH;
+        else if (mlen == 5 && ngx_strncasecmp(start, (u_char *)"TRACE", 5) == 0)
+            m |= NGX_HTTP_TRACE;
+        else if (mlen == 8 && ngx_strncasecmp(start, (u_char *)"PROPFIND", 8) == 0)
+            m |= NGX_HTTP_PROPFIND;
+        else if (mlen == 9 && ngx_strncasecmp(start, (u_char *)"PROPPATCH", 9) == 0)
+            m |= NGX_HTTP_PROPPATCH;
+        else if (mlen == 4 && ngx_strncasecmp(start, (u_char *)"COPY", 4) == 0)
+            m |= NGX_HTTP_COPY;
+        else if (mlen == 4 && ngx_strncasecmp(start, (u_char *)"MOVE", 4) == 0)
+            m |= NGX_HTTP_MOVE;
+        else if (mlen == 5 && ngx_strncasecmp(start, (u_char *)"MKCOL", 5) == 0)
+            m |= NGX_HTTP_MKCOL;
+        else if (mlen == 4 && ngx_strncasecmp(start, (u_char *)"LOCK", 4) == 0)
+            m |= NGX_HTTP_LOCK;
+        else if (mlen == 6 && ngx_strncasecmp(start, (u_char *)"UNLOCK", 6) == 0)
+            m |= NGX_HTTP_UNLOCK;
+        /* unknown method names are ignored */
+    }
+    return m;
 }
 
 
@@ -627,6 +814,13 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
                 h->auth_users[h->nauth_users].len = ngx_strlen(args[i]);
                 h->nauth_users++;
             }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"group") == 0) {
+            ngx_uint_t i;
+            for (i = 2; i < n && h->nrequire_groups < HTA_MAX_GROUPS; i++) {
+                h->require_groups[h->nrequire_groups].data = args[i];
+                h->require_groups[h->nrequire_groups].len = ngx_strlen(args[i]);
+                h->nrequire_groups++;
+            }
         } else if (ngx_strcasecmp(args[1], (u_char *)"ip") == 0 ||
                    ngx_strcasecmp(args[1], (u_char *)"host") == 0) {
             ngx_uint_t i;
@@ -638,6 +832,27 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
                 h->nacl++;
             }
         }
+        return;
+    }
+
+    /* ---- Satisfy Any/All ----
+     *
+     * Default is All: when BOTH access control (Allow/Deny/Require ip) AND
+     * auth (Require valid-user/user/group) are configured, both must pass.
+     * Satisfy Any: either one is sufficient.
+     */
+    if (ngx_strcasecmp(args[0], (u_char *)"Satisfy") == 0 && n >= 2) {
+        if (ngx_strcasecmp(args[1], (u_char *)"any") == 0)
+            h->satisfy = HTA_SATISFY_ANY;
+        else
+            h->satisfy = HTA_SATISFY_ALL;
+        return;
+    }
+
+    /* ---- AuthGroupFile ---- */
+    if (ngx_strcasecmp(args[0], (u_char *)"AuthGroupFile") == 0 && n >= 2) {
+        h->auth_group_file.data = args[1];
+        h->auth_group_file.len = ngx_strlen(args[1]);
         return;
     }
 
@@ -669,6 +884,48 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
                 hta_strip_crlf(hd->value.data, &hd->value.len);
             }
             h->nheaders++;
+        }
+        return;
+    }
+
+    /* ---- RequestHeader ----
+     *
+     * Modifies r->headers_in (the incoming request) before it is handed to
+     * upstreams (fastcgi/proxy). Supports set/add/append/unset; the rarely
+     * used `edit`/`edit*` regex-replace forms are accepted as no-ops.
+     */
+    if (ngx_strcasecmp(args[0], (u_char *)"RequestHeader") == 0 && n >= 2) {
+        if (h->nreq_headers < HTA_MAX_REQ_HEADERS) {
+            hta_header_t *hd = &h->req_headers[h->nreq_headers];
+            ngx_uint_t    off = 1;
+            u_char       *act = args[1];
+
+            if      (ngx_strcasecmp(act, (u_char *)"set") == 0)    hd->action = HTA_HDR_SET;
+            else if (ngx_strcasecmp(act, (u_char *)"unset") == 0)  hd->action = HTA_HDR_UNSET;
+            else if (ngx_strcasecmp(act, (u_char *)"append") == 0) hd->action = HTA_HDR_APPEND;
+            else if (ngx_strcasecmp(act, (u_char *)"add") == 0)    hd->action = HTA_HDR_ADD;
+            else if (ngx_strcasecmp(act, (u_char *)"merge") == 0)  hd->action = HTA_HDR_MERGE;
+            else if (ngx_strcasecmp(act, (u_char *)"edit") == 0
+                     || ngx_strcasecmp(act, (u_char *)"edit*") == 0) {
+                ngx_log_error(NGX_LOG_WARN, log, 0,
+                    "htaccess: RequestHeader edit/edit* not supported, "
+                    "directive ignored");
+                return;
+            } else return;
+
+            off++;
+            if (n <= off) return;
+
+            hd->name.data = args[off];
+            hd->name.len = ngx_strlen(args[off]);
+            hta_strip_crlf(hd->name.data, &hd->name.len);
+
+            if (hd->action != HTA_HDR_UNSET && n > off + 1) {
+                hd->value.data = args[off + 1];
+                hd->value.len = ngx_strlen(args[off + 1]);
+                hta_strip_crlf(hd->value.data, &hd->value.len);
+            }
+            h->nreq_headers++;
         }
         return;
     }
@@ -747,41 +1004,116 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
         return;
     }
 
-    /* ---- SetEnvIf ---- */
-    if (ngx_strcasecmp(args[0], (u_char *)"SetEnvIf") == 0 && n >= 4) {
-        if (h->nsetenvifs < HTA_MAX_SETENVIF) {
-            hta_setenvif_t     *se = &h->setenvifs[h->nsetenvifs];
+    /* ---- SetEnvIf / SetEnvIfNoCase / BrowserMatch / BrowserMatchNoCase ----
+     *
+     * SetEnvIf          attribute regex env[=val]...
+     * SetEnvIfNoCase    attribute regex env[=val]...    (case-insensitive regex)
+     * BrowserMatch      regex      env[=val]...         (User-Agent shorthand)
+     * BrowserMatchNoCase regex     env[=val]...
+     *
+     * Multiple env=val tokens are supported (one struct per token), matching
+     * Apache semantics. `!env` removes the variable instead of setting it.
+     */
+    {
+        unsigned   is_nocase = 0;
+        unsigned   is_browser = 0;
+        unsigned   handled = 0;
+
+        if (ngx_strcasecmp(args[0], (u_char *)"SetEnvIf") == 0) handled = 1;
+        else if (ngx_strcasecmp(args[0], (u_char *)"SetEnvIfNoCase") == 0) {
+            handled = 1; is_nocase = 1;
+        } else if (ngx_strcasecmp(args[0], (u_char *)"BrowserMatch") == 0) {
+            handled = 1; is_browser = 1;
+        } else if (ngx_strcasecmp(args[0], (u_char *)"BrowserMatchNoCase") == 0) {
+            handled = 1; is_browser = 1; is_nocase = 1;
+        }
+
+        if (handled) {
+            ngx_uint_t          first_env;
+            ngx_uint_t          ei;
+            ngx_regex_t        *regex = NULL;
+            ngx_str_t           attr, patt;
             ngx_regex_compile_t rc;
             u_char              errbuf[256];
-            u_char             *eq;
 
-            se->attribute.data = args[1];
-            se->attribute.len = ngx_strlen(args[1]);
-            se->pattern.data = args[2];
-            se->pattern.len = ngx_strlen(args[2]);
+            if (is_browser) {
+                if (n < 3) return;
+                ngx_str_set(&attr, "User-Agent");
+                patt.data = args[1]; patt.len = ngx_strlen(args[1]);
+                first_env = 2;
+            } else {
+                if (n < 4) return;
+                attr.data = args[1]; attr.len = ngx_strlen(args[1]);
+                patt.data = args[2]; patt.len = ngx_strlen(args[2]);
+                first_env = 3;
+            }
 
-            /* compile regex */
             ngx_memzero(&rc, sizeof(rc));
-            rc.pattern = se->pattern;
+            rc.pattern = patt;
             rc.pool = h->pool;
             rc.err.data = errbuf;
             rc.err.len = sizeof(errbuf);
-            if (ngx_regex_compile(&rc) == NGX_OK) {
-                se->regex = rc.regex;
-            } else {
-                se->regex = NULL;
-            }
+            if (is_nocase) rc.options = NGX_REGEX_CASELESS;
+            if (ngx_regex_compile(&rc) == NGX_OK) regex = rc.regex;
 
-            /* parse env=val or just env */
-            eq = (u_char *)ngx_strchr(args[3], '=');
-            if (eq) {
-                se->env_name.data = args[3];
-                se->env_name.len = eq - args[3];
-                se->env_value.data = eq + 1;
-                se->env_value.len = ngx_strlen(eq + 1);
+            for (ei = first_env; ei < n && h->nsetenvifs < HTA_MAX_SETENVIF;
+                 ei++)
+            {
+                hta_setenvif_t *se = &h->setenvifs[h->nsetenvifs];
+                u_char         *tok = args[ei];
+                u_char         *eq;
+
+                ngx_memzero(se, sizeof(hta_setenvif_t));
+                se->attribute = attr;
+                se->pattern   = patt;
+                se->regex     = regex;
+
+                /* leading '!' = unset the variable on match */
+                if (tok[0] == '!') {
+                    se->unset = 1;
+                    tok++;
+                }
+                eq = (u_char *)ngx_strchr(tok, '=');
+                if (eq) {
+                    se->env_name.data = tok;
+                    se->env_name.len  = eq - tok;
+                    se->env_value.data = eq + 1;
+                    se->env_value.len  = ngx_strlen(eq + 1);
+                } else {
+                    se->env_name.data = tok;
+                    se->env_name.len  = ngx_strlen(tok);
+                    ngx_str_set(&se->env_value, "1");
+                }
+
+                if (se->env_name.len == 0) continue;
+                h->nsetenvifs++;
+            }
+            return;
+        }
+    }
+
+    /* ---- SetEnv (unconditional) ----
+     *
+     *   SetEnv name [value]
+     *   UnsetEnv name
+     */
+    if ((ngx_strcasecmp(args[0], (u_char *)"SetEnv") == 0
+         || ngx_strcasecmp(args[0], (u_char *)"UnsetEnv") == 0)
+        && n >= 2)
+    {
+        unsigned is_unset = (ngx_strcasecmp(args[0], (u_char *)"UnsetEnv") == 0);
+
+        if (h->nsetenvifs < HTA_MAX_SETENVIF) {
+            hta_setenvif_t *se = &h->setenvifs[h->nsetenvifs];
+            ngx_memzero(se, sizeof(hta_setenvif_t));
+            se->unconditional = 1;
+            se->unset         = is_unset;
+            se->env_name.data = args[1];
+            se->env_name.len  = ngx_strlen(args[1]);
+            if (!is_unset && n >= 3) {
+                se->env_value.data = args[2];
+                se->env_value.len  = ngx_strlen(args[2]);
             } else {
-                se->env_name.data = args[3];
-                se->env_name.len = ngx_strlen(args[3]);
                 ngx_str_set(&se->env_value, "1");
             }
             h->nsetenvifs++;
@@ -909,10 +1241,54 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
         return;
     }
 
-    /* ---- php_value / php_admin_value / php_flag - ignore with debug log ---- */
-    if (ngx_strncasecmp(args[0], (u_char *)"php_", 4) == 0) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
-            "htaccess: ignoring PHP directive \"%s\"", args[0]);
+    /* ---- php_value / php_admin_value / php_flag / php_admin_flag ----
+     *
+     * Translated to fastcgi PHP_VALUE / PHP_ADMIN_VALUE entries that the
+     * user injects via the $htaccess_php_value / $htaccess_php_admin_value
+     * variables, e.g.:
+     *   location ~ \.php$ {
+     *       fastcgi_param PHP_VALUE       $htaccess_php_value;
+     *       fastcgi_param PHP_ADMIN_VALUE $htaccess_php_admin_value;
+     *   }
+     */
+    if (ngx_strncasecmp(args[0], (u_char *)"php_", 4) == 0 && n >= 3) {
+        u_char    *d = args[0] + 4;
+        unsigned   is_admin = 0;
+        unsigned   is_known = 0;
+
+        if (ngx_strncasecmp(d, (u_char *)"admin_", 6) == 0) {
+            is_admin = 1;
+            d += 6;
+        }
+        if (ngx_strcasecmp(d, (u_char *)"value") == 0
+            || ngx_strcasecmp(d, (u_char *)"flag") == 0)
+        {
+            is_known = 1;
+        }
+
+        if (is_known && h->nphp_values < HTA_MAX_PHP_VALUES) {
+            hta_php_value_t *pv = &h->php_values[h->nphp_values];
+            pv->name.data  = args[1];
+            pv->name.len   = ngx_strlen(args[1]);
+            pv->value.data = args[2];
+            pv->value.len  = ngx_strlen(args[2]);
+            pv->is_admin   = is_admin;
+
+            /* defang the value: '\n' or '"' would corrupt PHP_VALUE syntax */
+            {
+                u_char    *vp = pv->value.data;
+                ngx_uint_t k;
+                for (k = 0; k < pv->value.len; k++) {
+                    if (vp[k] == '\n' || vp[k] == '\r'
+                        || vp[k] == '"'  || vp[k] == '\0')
+                        vp[k] = ' ';
+                }
+            }
+            h->nphp_values++;
+        } else if (!is_known) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                "htaccess: ignoring unknown PHP directive \"%s\"", args[0]);
+        }
         return;
     }
 
@@ -926,8 +1302,7 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
     /* ---- AddCharset - ignore ---- */
     if (ngx_strcasecmp(args[0], (u_char *)"AddCharset") == 0) return;
 
-    /* ---- Satisfy - ignore (deprecated in Apache 2.4) ---- */
-    if (ngx_strcasecmp(args[0], (u_char *)"Satisfy") == 0) return;
+    /* Satisfy is handled above (see "Satisfy Any/All") */
 
     /* ---- SetHandler - ignore ---- */
     if (ngx_strcasecmp(args[0], (u_char *)"SetHandler") == 0) return;
@@ -963,16 +1338,21 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
     if (ngx_strcasecmp(args[0], (u_char *)"ForceLanguagePriority") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"AddInputFilter") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"AddOutputFilter") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"BrowserMatch") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"BrowserMatchNoCase") == 0) return;
+    /* BrowserMatch / BrowserMatchNoCase handled above with SetEnvIf family */
     if (ngx_strcasecmp(args[0], (u_char *)"SSLOptions") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"SSLRequireSSL") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"SSLRequire") == 0) return;
+    if (ngx_strcasecmp(args[0], (u_char *)"SSLRequireSSL") == 0) {
+        h->ssl_required = 1;
+        return;
+    }
+    /* SSLRequire takes an Apache expression; we treat any form as "require HTTPS" */
+    if (ngx_strcasecmp(args[0], (u_char *)"SSLRequire") == 0) {
+        h->ssl_required = 1;
+        return;
+    }
     if (ngx_strcasecmp(args[0], (u_char *)"Action") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"SetEnvIfNoCase") == 0) return;
+    /* SetEnvIfNoCase, UnsetEnv handled above with SetEnvIf family */
+    /* RequestHeader handled above with response Header */
     if (ngx_strcasecmp(args[0], (u_char *)"PassEnv") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"UnsetEnv") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"RequestHeader") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"SecFilterEngine") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"SecFilterScanPOST") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"SecRule") == 0) return;
@@ -1023,7 +1403,7 @@ hta_should_enter_block(u_char *line, ngx_uint_t len)
     /* <Files ...>, <FilesMatch ...> - enter (apply to matching files) */
     if (len >= 7 && ngx_strncasecmp(line + 1, (u_char *)"Files", 5) == 0) return 1;
 
-    /* <Limit ...>, <LimitExcept ...> - enter (we apply all methods) */
+    /* <Limit ...>, <LimitExcept ...> - handled separately by file parser */
     if (len >= 7 && ngx_strncasecmp(line + 1, (u_char *)"Limit", 5) == 0) return 1;
 
     /* <RequireAll>, <RequireAny>, <RequireNone> - enter (simplified) */
@@ -1054,6 +1434,8 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
     ngx_int_t          skip_depth;
     hta_files_block_t *cur_fb;
     ngx_int_t          files_depth;
+    hta_limit_block_t *cur_lb;
+    ngx_int_t          limit_depth;
 
     fd = ngx_open_file(filepath, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) return NULL;
@@ -1082,6 +1464,8 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
     skip_depth = 0;   /* >0 means we're inside a skipped block */
     cur_fb = NULL;     /* non-NULL = inside <Files> block */
     files_depth = 0;   /* nesting depth within Files block */
+    cur_lb = NULL;     /* non-NULL = inside <Limit>/<LimitExcept> block */
+    limit_depth = 0;
 
     p = buf;
     end = buf + nr;
@@ -1154,6 +1538,12 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
                                 } else {
                                     cur_fb = NULL;
                                 }
+                            } else if (cur_lb) {
+                                if (limit_depth > 0) {
+                                    limit_depth--;
+                                } else {
+                                    cur_lb = NULL;
+                                }
                             }
                         } else if (tlen > 1 && trimmed[0] == '<'
                                    && trimmed[tlen-1] == '>') {
@@ -1165,6 +1555,51 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
                                 if (hta_should_enter_block(trimmed, tlen)) {
                                     files_depth++;
                                 } else {
+                                    skip_depth = 1;
+                                }
+                            } else if (cur_lb) {
+                                /* nested inside <Limit> - skip (not supported) */
+                                skip_depth = 1;
+                            } else if (ngx_strncasecmp(trimmed + 1,
+                                           (u_char *)"LimitExcept", 11) == 0
+                                       || ngx_strncasecmp(trimmed + 1,
+                                           (u_char *)"Limit ", 6) == 0
+                                       || ngx_strncasecmp(trimmed + 1,
+                                           (u_char *)"Limit>", 6) == 0)
+                            {
+                                /* <Limit ...> / <LimitExcept ...>: always
+                                 * consume the inner block so directives
+                                 * don't leak into the global scope, even if
+                                 * the per-file cap is reached. */
+                                if (h->nlimit_blocks
+                                        < HTA_MAX_LIMIT_BLOCKS)
+                                {
+                                    hta_limit_block_t *lb =
+                                        &h->limit_blocks[h->nlimit_blocks];
+                                    u_char *ps, *pe;
+
+                                    ngx_memzero(lb, sizeof(hta_limit_block_t));
+
+                                    lb->is_except = (ngx_strncasecmp(trimmed + 1,
+                                        (u_char *)"LimitExcept", 11) == 0);
+
+                                    ps = trimmed + (lb->is_except ? 12 : 6);
+                                    pe = trimmed + tlen - 1;
+                                    lb->methods = hta_parse_methods(ps, pe);
+
+                                    if (lb->methods == 0) {
+                                        ngx_log_error(NGX_LOG_WARN, log, 0,
+                                            "htaccess: <Limit> with no "
+                                            "recognized methods, block "
+                                            "will be inert");
+                                    }
+
+                                    cur_lb = lb;
+                                    h->nlimit_blocks++;
+                                } else {
+                                    ngx_log_error(NGX_LOG_WARN, log, 0,
+                                        "htaccess: too many <Limit> blocks, "
+                                        "skipping");
                                     skip_depth = 1;
                                 }
                             } else if (ngx_strncasecmp(trimmed + 1,
@@ -1225,6 +1660,8 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
                             if (cur_fb) {
                                 hta_parse_line_fb(cur_fb, wl, parse_len,
                                                   pool, log);
+                            } else if (cur_lb) {
+                                hta_parse_line_lb(cur_lb, wl, parse_len, log);
                             } else {
                                 hta_parse_line(h, wl, parse_len, log);
                             }

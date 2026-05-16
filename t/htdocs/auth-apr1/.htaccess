@@ -1,0 +1,4 @@
+AuthType Basic
+AuthName "APR1 test"
+AuthUserFile __HTDOCS_ROOT__/auth-apr1/.htpasswd
+Require valid-user

@@ -68,7 +68,19 @@ for f in "${HTDOCS_ROOT}"/rewrite/target.html \
          "${HTDOCS_ROOT}"/setenvif/test.html \
          "${HTDOCS_ROOT}"/security/normal.html \
          "${HTDOCS_ROOT}"/access/allowed.html \
-         "${HTDOCS_ROOT}"/auth/protected.html; do
+         "${HTDOCS_ROOT}"/auth/protected.html \
+         "${HTDOCS_ROOT}"/limit/post-auth/page.html \
+         "${HTDOCS_ROOT}"/limit/get-only/page.html \
+         "${HTDOCS_ROOT}"/ssl-required/page.html \
+         "${HTDOCS_ROOT}"/php-values/page.html \
+         "${HTDOCS_ROOT}"/setenv/page.html \
+         "${HTDOCS_ROOT}"/satisfy/by-ip/page.html \
+         "${HTDOCS_ROOT}"/satisfy/strict/page.html \
+         "${HTDOCS_ROOT}"/auth-sha/page.html \
+         "${HTDOCS_ROOT}"/auth-apr1/page.html \
+         "${HTDOCS_ROOT}"/groups/page.html \
+         "${HTDOCS_ROOT}"/groups/files-secret.html \
+         "${HTDOCS_ROOT}"/reqheader/page.html; do
     dir=$(dirname "$f")
     mkdir -p "$dir"
     if [ ! -f "$f" ]; then
@@ -86,6 +98,41 @@ if [ ! -f "${HTDOCS_ROOT}/auth/.htpasswd" ]; then
     echo "testuser:${HASH}" > "${HTDOCS_ROOT}/auth/.htpasswd"
     HASH2=$(openssl passwd -6 "otherpass")
     echo "otheruser:${HASH2}" >> "${HTDOCS_ROOT}/auth/.htpasswd"
+fi
+
+# Substitute __HTDOCS_ROOT__ placeholders in .htaccess files that need
+# absolute paths (AuthUserFile, AuthGroupFile, etc.). Done in-place; safe to
+# re-run because the placeholder is only present in pristine checked-in files.
+for f in "${HTDOCS_ROOT}/auth/.htaccess" \
+         "${HTDOCS_ROOT}/limit/post-auth/.htaccess" \
+         "${HTDOCS_ROOT}/satisfy/by-ip/.htaccess" \
+         "${HTDOCS_ROOT}/satisfy/strict/.htaccess" \
+         "${HTDOCS_ROOT}/auth-sha/.htaccess" \
+         "${HTDOCS_ROOT}/auth-apr1/.htaccess" \
+         "${HTDOCS_ROOT}/groups/.htaccess"; do
+    [ -f "$f" ] && sed -i "s|__HTDOCS_ROOT__|${HTDOCS_ROOT}|g" "$f"
+done
+
+# Generate {SHA} and $apr1$ htpasswd files for native runs (Docker generates
+# these in the image build step, but native users need them too).
+if command -v sha1sum >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
+    if [ ! -f "${HTDOCS_ROOT}/auth-sha/.htpasswd" ]; then
+        mkdir -p "${HTDOCS_ROOT}/auth-sha"
+        SHA_HASH=$(printf '%s' 'testpass' | sha1sum | awk '{print $1}' | \
+                   xxd -r -p | base64)
+        echo "shauser:{SHA}${SHA_HASH}" > "${HTDOCS_ROOT}/auth-sha/.htpasswd"
+    fi
+fi
+if command -v htpasswd >/dev/null 2>&1; then
+    if [ ! -f "${HTDOCS_ROOT}/auth-apr1/.htpasswd" ]; then
+        mkdir -p "${HTDOCS_ROOT}/auth-apr1"
+        htpasswd -bcm "${HTDOCS_ROOT}/auth-apr1/.htpasswd" apruser testpass
+    fi
+fi
+if [ ! -f "${HTDOCS_ROOT}/groups/.htgroup" ]; then
+    mkdir -p "${HTDOCS_ROOT}/groups"
+    printf 'admins: testuser\nusers: testuser otheruser\nempty:\n' \
+        > "${HTDOCS_ROOT}/groups/.htgroup"
 fi
 
 # Start nginx

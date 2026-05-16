@@ -2,66 +2,71 @@
 
 ## Project
 
-Native C module for nginx that adds Apache `.htaccess` support. Linux only (inotify, crypt, lstat).
+Native C module for nginx that adds Apache `.htaccess` support. Linux only
+(inotify, crypt, lstat). Tested on nginx 1.24.0, 1.28.2, 1.30.1.
 
 ## Build
 
 ```bash
-# Docker (recommended)
+# Docker (recommended) - override NGINX_VERSION to test other versions
 docker build -t nginx-htaccess-test .
 docker run --rm nginx-htaccess-test
 
 # Native (requires nginx source)
-make build NGINX_VERSION=1.28.2
+make build NGINX_VERSION=1.30.1
 make test
 ```
 
 ## Test
 
 ```bash
-# All tests
 docker run --rm nginx-htaccess-test bash /tests/run_tests.sh
-
-# Demo
-cd demo && ./demo.sh
+cd demo && ./demo.sh                              # interactive demos
 ```
 
-## Project structure
+## Project structure (flat, nginx convention)
 
-Flat layout (nginx module convention, no src/ directory):
-
-- `ngx_http_htaccess_module.h` - types, constants, declarations
-- `ngx_http_htaccess_module.c` - module definition, config, phase handlers
-- `ngx_http_htaccess_parser.c` - .htaccess parsing, directive dispatch
-- `ngx_http_htaccess_rewrite.c` - rewrite engine, variable expansion, redirects
-- `ngx_http_htaccess_access.c` - access control, IP matching, Basic auth
+- `ngx_http_htaccess_module.{h,c}` - types, module def, phase handlers
+- `ngx_http_htaccess_parser.c` - .htaccess tokenizer + directive dispatch
+- `ngx_http_htaccess_rewrite.c` - rewrite engine, SetEnvIf, RequestHeader
+- `ngx_http_htaccess_access.c` - access control, Basic auth, htgroup, APR1
 - `ngx_http_htaccess_header.c` - response header filter, AddType, Expires
-- `ngx_http_htaccess_cache.c` - per-worker cache with inotify invalidation
-- `config` - nginx build system integration
-- `t/` - shell-based test suite
+- `ngx_http_htaccess_cache.c` - per-worker parsed cache + inotify
+- `config` - nginx build integration
+- `t/` - shell-based tests (125+ cases)
 - `demo/` - Docker demos (simple + WordPress)
 
 ## Code style
 
-- nginx coding conventions: `ngx_` prefixes, `ngx_int_t`/`ngx_str_t` types, pool-based allocation
-- Module-internal functions use `hta_` prefix
-- No malloc/free - use `ngx_palloc`/`ngx_pnalloc` with request or cycle pools
-- Strings are `ngx_str_t` (pointer + length), not null-terminated unless interfacing with libc
+- nginx conventions: `ngx_` prefixes, `ngx_int_t`/`ngx_str_t`, pool alloc
+- Module-internal functions: `hta_` prefix
+- No malloc/free - use `ngx_palloc`/`ngx_pnalloc` (request or cycle pool)
+- `ngx_str_t` is (pointer, length), not NUL-terminated by default
 
-## Security considerations
+## Security
 
-- Constant-time password comparison (`hta_constant_time_strcmp`) to prevent timing attacks
-- Secure memory zeroing (`hta_secure_zero` with volatile pointer) after password use
-- Path traversal prevention: `..` segments rejected in URI traversal and AuthUserFile paths
-- REQUEST_FILENAME expansion checks for `..` before constructing filesystem paths
-- File test conditions (-f, -d, -l, -e, -s) reject paths containing `..`
-- Direct access to .htaccess/.htpasswd/.htgroup/.htdigest blocked with 403
-- File size limits: 1MB max for .htaccess and .htpasswd files
-- PCRE match limits controlled by nginx.conf (`pcre_jit on;`), not per-call
+- Constant-time compare (`hta_constant_time_memcmp`) on all password hashes
+- `hta_secure_zero` (volatile pointer) on passwords and intermediate buffers
+- Decoded `Basic` `user:pass` blob zeroed before auth handler returns
+- Path-traversal guards on `AuthUserFile`, `AuthGroupFile`, URI traversal,
+  REQUEST_FILENAME expansion, all file-test conditions (-f, -d, -l, -e, -s)
+- Direct access to `.htaccess`/`.htpasswd`/`.htgroup`/`.htdigest` -> 403
+- File-size cap: 1 MB on `.htaccess` / `.htpasswd` / `.htgroup`
+- `Require group` inside `<Files>` / `<Limit>` IS propagated (bypass class)
+- CR/LF stripped from `Header` and `RequestHeader` values at parse time
+- All header lookups use `ngx_strncasecmp` (case-insensitive)
 
 ## Common pitfalls
 
-- nginx is single-threaded per worker (event-driven), no mutex needed for per-worker cache
-- Dynamic modules require exact nginx version match (ABI compatibility)
-- `ngx_explicit_memzero` may not exist in older nginx versions, use `hta_secure_zero` instead
-- `.gitignore` has `.*` pattern with exceptions for `.htaccess`, `.htpasswd`, `.github/`, `.gitignore`
+- nginx is single-threaded per worker -> no mutex for per-worker cache
+- Dynamic modules require exact nginx version match (ABI compat)
+- `ngx_explicit_memzero` is unavailable on older nginx -> use `hta_secure_zero`
+- **REWRITE_PHASE handler order is REVERSED by nginx** (`ngx_http_init_phase_handlers`
+  walks the array end-to-start). Our REWRITE handler runs BEFORE the rewrite
+  module's `set`/`return` script. SetEnv values therefore get re-applied in
+  a PREACCESS handler so `set $foo "";` in nginx.conf does not clobber them.
+- `.gitignore` uses `.*` with exceptions for `.htaccess`, `.htpasswd`,
+  `.github/`, `.gitignore`
+- Supported htpasswd hash formats: `$apr1$` (custom impl via ngx_md5),
+  `$1$`/`$5$`/`$6$` (glibc crypt), bcrypt `$2[aby]$`, `{SHA}` (ngx_sha1),
+  legacy DES. NOT supported: plain-text passwords (rejected by length check).

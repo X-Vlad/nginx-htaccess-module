@@ -30,6 +30,11 @@
 #define HTA_MAX_FILES_BLOCKS  16
 #define HTA_MAX_FB_ACL        16
 #define HTA_MAX_FB_HEADERS    16
+#define HTA_MAX_LIMIT_BLOCKS  8
+#define HTA_MAX_LB_ACL        16
+#define HTA_MAX_PHP_VALUES    32
+#define HTA_MAX_GROUPS        16  /* Require group entries per scope */
+#define HTA_MAX_REQ_HEADERS   32  /* RequestHeader actions */
 #define HTA_CACHE_SLOTS       1024
 #define HTA_PASSWD_SLOTS      256
 #define HTA_INOTIFY_BUF       4096
@@ -78,6 +83,10 @@
 #define HTA_HDR_APPEND         2
 #define HTA_HDR_ADD            3
 #define HTA_HDR_MERGE          4
+
+/* Satisfy directive */
+#define HTA_SATISFY_ALL        0   /* default: both access and auth must pass */
+#define HTA_SATISFY_ANY        1   /* either access OR auth is enough */
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -138,6 +147,8 @@ typedef struct {
     ngx_regex_t *regex;
     ngx_str_t    env_name;
     ngx_str_t    env_value;
+    unsigned     unconditional:1;  /* SetEnv (no regex test) */
+    unsigned     unset:1;          /* env_name should be unset, not set */
 } hta_setenvif_t;
 
 typedef struct {
@@ -164,8 +175,11 @@ typedef struct {
     unsigned     auth_valid_user:1;
     ngx_str_t    auth_name;
     ngx_str_t    auth_user_file;
+    ngx_str_t    auth_group_file;
     ngx_str_t    auth_users[8];
     ngx_uint_t   nauth_users;
+    ngx_str_t    require_groups[8];
+    ngx_uint_t   nrequire_groups;
     /* headers */
     hta_header_t headers[HTA_MAX_FB_HEADERS];
     ngx_uint_t   nheaders;
@@ -174,6 +188,36 @@ typedef struct {
     hta_addtype_t addtypes[8];
     ngx_uint_t    naddtypes;
 } hta_files_block_t;
+
+typedef struct {
+    ngx_str_t    name;
+    ngx_str_t    value;
+    unsigned     is_admin:1;   /* php_admin_value / php_admin_flag */
+} hta_php_value_t;
+
+typedef struct {
+    /* method bitmap of NGX_HTTP_GET|NGX_HTTP_POST|... that the block matches */
+    ngx_uint_t   methods;
+    /* if set, methods is an exclusion list (LimitExcept) */
+    unsigned     is_except:1;
+    /* access control inside the block */
+    unsigned     has_acl:1;
+    unsigned     require_denied:1;
+    unsigned     require_granted:1;
+    ngx_uint_t   access_order;
+    hta_access_t acl[HTA_MAX_LB_ACL];
+    ngx_uint_t   nacl;
+    /* auth inside the block */
+    unsigned     auth_basic:1;
+    unsigned     auth_valid_user:1;
+    ngx_str_t    auth_name;
+    ngx_str_t    auth_user_file;
+    ngx_str_t    auth_group_file;
+    ngx_str_t    auth_users[8];
+    ngx_uint_t   nauth_users;
+    ngx_str_t    require_groups[8];
+    ngx_uint_t   nrequire_groups;
+} hta_limit_block_t;
 
 typedef struct {
     /* rewrite */
@@ -209,6 +253,10 @@ typedef struct {
     hta_header_t      headers[HTA_MAX_HEADERS];
     ngx_uint_t        nheaders;
 
+    /* request headers (RequestHeader directive: modify r->headers_in) */
+    hta_header_t      req_headers[HTA_MAX_REQ_HEADERS];
+    ngx_uint_t        nreq_headers;
+
     /* auth */
     unsigned          auth_basic:1;
     unsigned          auth_valid_user:1;
@@ -216,6 +264,14 @@ typedef struct {
     ngx_str_t         auth_user_file;
     ngx_str_t         auth_users[HTA_MAX_USERS];
     ngx_uint_t        nauth_users;
+
+    /* AuthGroupFile + Require group */
+    ngx_str_t         auth_group_file;
+    ngx_str_t         require_groups[HTA_MAX_GROUPS];
+    ngx_uint_t        nrequire_groups;
+
+    /* Satisfy Any/All - default All (auth AND access both required) */
+    ngx_uint_t        satisfy;
 
     /* types */
     ngx_str_t         force_type;
@@ -243,8 +299,19 @@ typedef struct {
     hta_files_block_t files_blocks[HTA_MAX_FILES_BLOCKS];
     ngx_uint_t        nfiles_blocks;
 
+    /* <Limit> / <LimitExcept> blocks */
+    hta_limit_block_t limit_blocks[HTA_MAX_LIMIT_BLOCKS];
+    ngx_uint_t        nlimit_blocks;
+
+    /* php_value / php_admin_value / php_flag / php_admin_flag */
+    hta_php_value_t   php_values[HTA_MAX_PHP_VALUES];
+    ngx_uint_t        nphp_values;
+
     /* AddDefaultCharset */
     ngx_str_t         default_charset;
+
+    /* SSLRequireSSL - require HTTPS */
+    unsigned          ssl_required:1;
 
     /* meta */
     time_t            mtime;
@@ -334,6 +401,12 @@ ngx_int_t hta_check_access(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_files_access(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h);
+ngx_int_t hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h);
+ngx_int_t hta_check_limit_access(ngx_http_request_t *r, hta_parsed_t *h);
+ngx_int_t hta_check_limit_auth(ngx_http_request_t *r, hta_parsed_t *h);
+
+/* rewrite.c */
+void hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h);
 
 /* header.c */
 ngx_int_t hta_header_filter(ngx_http_request_t *r);

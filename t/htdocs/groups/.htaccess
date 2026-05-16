@@ -1,0 +1,15 @@
+AuthType Basic
+AuthName "Group test"
+AuthUserFile  __HTDOCS_ROOT__/auth/.htpasswd
+AuthGroupFile __HTDOCS_ROOT__/groups/.htgroup
+Require group admins
+
+# regression: Require group inside <Files> must be enforced, not silently
+# dropped (auth-bypass class fix)
+<Files "files-secret.html">
+    AuthType Basic
+    AuthName "Files Admins"
+    AuthUserFile  __HTDOCS_ROOT__/auth/.htpasswd
+    AuthGroupFile __HTDOCS_ROOT__/groups/.htgroup
+    Require group admins
+</Files>

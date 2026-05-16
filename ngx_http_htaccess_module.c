@@ -15,7 +15,10 @@
  *   ForceType, DefaultType, AddType
  *   ExpiresActive, ExpiresDefault, ExpiresByType
  *   SetEnvIf
- *   <IfModule>, <Files>, <FilesMatch> (block tags)
+ *   SSLRequireSSL, SSLRequire (require HTTPS)
+ *   php_value, php_admin_value, php_flag, php_admin_flag
+ *     (exposed via $htaccess_php_value / $htaccess_php_admin_value)
+ *   <IfModule>, <Files>, <FilesMatch>, <Limit>, <LimitExcept>
  *
  * Features:
  *   - Nested .htaccess traversal (root → deepest directory)
@@ -36,6 +39,7 @@
  * Forward declarations
  * ═══════════════════════════════════════════════════════════════════════ */
 
+static ngx_int_t hta_preconfigure(ngx_conf_t *cf);
 static ngx_int_t hta_postconfigure(ngx_conf_t *cf);
 static ngx_int_t hta_init_process(ngx_cycle_t *cycle);
 static void      hta_exit_process(ngx_cycle_t *cycle);
@@ -44,7 +48,11 @@ static void     *hta_create_loc(ngx_conf_t *cf);
 static char     *hta_merge_loc(ngx_conf_t *cf, void *parent, void *child);
 
 static ngx_int_t hta_rewrite_handler(ngx_http_request_t *r);
+static ngx_int_t hta_preaccess_handler(ngx_http_request_t *r);
 static ngx_int_t hta_access_handler(ngx_http_request_t *r);
+
+static ngx_int_t hta_var_php_value(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t is_admin);
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -70,7 +78,7 @@ static ngx_command_t hta_commands[] = {
 };
 
 static ngx_http_module_t hta_module_ctx = {
-    NULL,                    /* preconfiguration */
+    hta_preconfigure,        /* preconfiguration */
     hta_postconfigure,       /* postconfiguration */
     hta_create_main,         /* create main conf */
     NULL,                    /* init main conf */
@@ -130,6 +138,39 @@ hta_merge_loc(ngx_conf_t *cf, void *parent, void *child)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Preconfiguration - register nginx variables
+ *
+ * $htaccess_php_value, $htaccess_php_admin_value: newline-separated
+ * "name=value" pairs collected from php_value / php_admin_value / php_flag /
+ * php_admin_flag directives. Wire them into fastcgi via:
+ *   fastcgi_param PHP_VALUE       $htaccess_php_value;
+ *   fastcgi_param PHP_ADMIN_VALUE $htaccess_php_admin_value;
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_http_variable_t hta_vars[] = {
+    { ngx_string("htaccess_php_value"), NULL,
+      hta_var_php_value, 0, 0, 0 },
+    { ngx_string("htaccess_php_admin_value"), NULL,
+      hta_var_php_value, 1, 0, 0 },
+    { ngx_null_string, NULL, NULL, 0, 0, 0 }
+};
+
+static ngx_int_t
+hta_preconfigure(ngx_conf_t *cf)
+{
+    ngx_http_variable_t *v, *vp;
+
+    for (vp = hta_vars; vp->name.len; vp++) {
+        v = ngx_http_add_variable(cf, &vp->name, vp->flags);
+        if (v == NULL) return NGX_ERROR;
+        v->get_handler = vp->get_handler;
+        v->data = vp->data;
+    }
+    return NGX_OK;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Postconfiguration - register phase handlers and header filter
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -145,6 +186,13 @@ hta_postconfigure(ngx_conf_t *cf)
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
     if (h == NULL) return NGX_ERROR;
     *h = hta_rewrite_handler;
+
+    /* preaccess phase - re-apply SetEnvIf/SetEnv so its values stick AFTER
+     * any `set $foo "";` in the location's rewrite script (nginx reverses
+     * REWRITE_PHASE handler order, so our handler there runs BEFORE `set`). */
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
+    if (h == NULL) return NGX_ERROR;
+    *h = hta_preaccess_handler;
 
     /* access phase - access control & auth */
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
@@ -346,6 +394,87 @@ hta_get_files(ngx_http_request_t *r, ngx_str_t *root, ngx_str_t *filename)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Variable handler: $htaccess_php_value / $htaccess_php_admin_value
+ *
+ * Walks the .htaccess chain for the request and concatenates collected
+ * php_value/php_flag entries matching the admin/non-admin flag, formatted
+ * as "name=value\nname=value\n..." for fastcgi PHP_VALUE consumption.
+ *
+ * Empty string when nothing collected — the fastcgi module treats an empty
+ * PHP_VALUE param as a no-op, matching the "no .htaccess" case.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_var_php_value(ngx_http_request_t *r, ngx_http_variable_value_t *v,
+    uintptr_t is_admin)
+{
+    ngx_http_hta_loc_conf_t   *lcf;
+    ngx_http_hta_main_conf_t  *mc;
+    ngx_http_core_loc_conf_t  *clcf;
+    hta_file_list_t           *files;
+    hta_parsed_t              *parsed_list[HTA_MAX_DEPTH];
+    ngx_uint_t                 nparsed = 0;
+    ngx_uint_t                 i, j;
+    size_t                     total = 0;
+    u_char                    *buf, *p;
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    v->len = 0;
+    v->data = (u_char *) "";
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_htaccess_module);
+    if (lcf == NULL || !lcf->enable) return NGX_OK;
+
+    mc = ngx_http_get_module_main_conf(r, ngx_http_htaccess_module);
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (mc == NULL || clcf == NULL || clcf->root.len == 0) return NGX_OK;
+
+    files = hta_get_files(r, &clcf->root, &lcf->filename);
+    if (files == NULL || files->count == 0) return NGX_OK;
+
+    /* first pass: collect parsed files and total output size */
+    for (i = 0; i < files->count; i++) {
+        hta_parsed_t *h = hta_get_parsed(r, mc, &files->files[i]);
+        if (h == NULL) continue;
+        if (nparsed >= HTA_MAX_DEPTH) break;
+        parsed_list[nparsed++] = h;
+
+        for (j = 0; j < h->nphp_values; j++) {
+            hta_php_value_t *pv = &h->php_values[j];
+            if ((pv->is_admin ? 1u : 0u) != (ngx_uint_t) is_admin) continue;
+            total += pv->name.len + 1 + pv->value.len + 1; /* name=value\n */
+        }
+    }
+    if (total == 0) return NGX_OK;
+
+    buf = ngx_pnalloc(r->pool, total);
+    if (buf == NULL) return NGX_ERROR;
+    p = buf;
+
+    for (i = 0; i < nparsed; i++) {
+        hta_parsed_t *h = parsed_list[i];
+        for (j = 0; j < h->nphp_values; j++) {
+            hta_php_value_t *pv = &h->php_values[j];
+            if ((pv->is_admin ? 1u : 0u) != (ngx_uint_t) is_admin) continue;
+            p = ngx_cpymem(p, pv->name.data, pv->name.len);
+            *p++ = '=';
+            p = ngx_cpymem(p, pv->value.data, pv->value.len);
+            *p++ = '\n';
+        }
+    }
+
+    /* trim trailing newline */
+    if (p > buf && p[-1] == '\n') p--;
+
+    v->data = buf;
+    v->len  = p - buf;
+    return NGX_OK;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Rewrite phase handler - entry point
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -385,6 +514,9 @@ hta_rewrite_handler(ngx_http_request_t *r)
         /* apply SetEnvIf early (before rewrite rules) */
         hta_apply_setenvif(r, h);
 
+        /* mutate request headers before upstream phases see them */
+        hta_apply_request_headers(r, h);
+
         rc = hta_apply_dirindex(r, h);
         if (rc != NGX_DECLINED) return rc;
 
@@ -393,6 +525,47 @@ hta_rewrite_handler(ngx_http_request_t *r)
 
         rc = hta_apply_rules(r, h);
         if (rc != NGX_DECLINED) return rc;
+    }
+
+    return NGX_DECLINED;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Preaccess phase handler - re-apply SetEnvIf/SetEnv
+ *
+ * The rewrite phase reverses handler order, so our REWRITE_PHASE handler
+ * runs BEFORE nginx's rewrite-module script. If the user's nginx.conf has
+ * `set $foo "";` to declare a variable, that `set` overwrites the value we
+ * computed from SetEnv/SetEnvIf. Re-apply here, after the rewrite script
+ * has fully run, so the final variable value reflects .htaccess intent.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_preaccess_handler(ngx_http_request_t *r)
+{
+    ngx_http_hta_loc_conf_t   *lcf;
+    ngx_http_hta_main_conf_t  *mc;
+    ngx_http_core_loc_conf_t  *clcf;
+    hta_file_list_t           *files;
+    ngx_uint_t                 i;
+
+    if (r != r->main) return NGX_DECLINED;
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_htaccess_module);
+    if (!lcf->enable) return NGX_DECLINED;
+
+    mc   = ngx_http_get_module_main_conf(r, ngx_http_htaccess_module);
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf->root.len == 0) return NGX_DECLINED;
+
+    files = hta_get_files(r, &clcf->root, &lcf->filename);
+    if (files == NULL) return NGX_DECLINED;
+
+    for (i = 0; i < files->count; i++) {
+        hta_parsed_t *h = hta_get_parsed(r, mc, &files->files[i]);
+        if (h == NULL) continue;
+        hta_apply_setenvif(r, h);
     }
 
     return NGX_DECLINED;
@@ -464,17 +637,43 @@ hta_access_handler(ngx_http_request_t *r)
         if (h == NULL) continue;
         if (nparsed < HTA_MAX_DEPTH) parsed_list[nparsed++] = h;
 
-        rc = hta_check_access(r, h);
+        rc = hta_check_ssl(r, h);
         if (rc != NGX_OK) goto check_errdoc;
 
-        rc = hta_check_auth(r, h);
-        if (rc != NGX_OK) goto check_errdoc;
+        /* Satisfy semantics:
+         *   All (default): access AND auth must both pass
+         *   Any:           either one is sufficient. Only run auth if access
+         *                  denied; that way we don't push a stale
+         *                  WWW-Authenticate header onto a request that
+         *                  already passed by IP. */
+        if (h->satisfy == HTA_SATISFY_ANY) {
+            ngx_int_t rc_access = hta_check_access(r, h);
+            if (rc_access == NGX_OK) {
+                /* access OK, skip auth entirely */
+            } else {
+                rc = hta_check_auth(r, h);
+                if (rc != NGX_OK) goto check_errdoc;
+            }
+        } else {
+            rc = hta_check_access(r, h);
+            if (rc != NGX_OK) goto check_errdoc;
+
+            rc = hta_check_auth(r, h);
+            if (rc != NGX_OK) goto check_errdoc;
+        }
 
         /* <Files>/<FilesMatch> block access */
         rc = hta_check_files_access(r, h);
         if (rc != NGX_OK) goto check_errdoc;
 
         rc = hta_check_files_auth(r, h);
+        if (rc != NGX_OK) goto check_errdoc;
+
+        /* <Limit>/<LimitExcept> block access + auth */
+        rc = hta_check_limit_access(r, h);
+        if (rc != NGX_OK) goto check_errdoc;
+
+        rc = hta_check_limit_auth(r, h);
         if (rc != NGX_OK) goto check_errdoc;
     }
 

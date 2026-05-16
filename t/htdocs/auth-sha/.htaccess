@@ -1,0 +1,4 @@
+AuthType Basic
+AuthName "SHA test"
+AuthUserFile __HTDOCS_ROOT__/auth-sha/.htpasswd
+Require valid-user

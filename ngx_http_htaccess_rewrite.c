@@ -617,6 +617,46 @@ hta_check_errdoc(ngx_http_request_t *r, hta_parsed_t *h, ngx_int_t status)
  * SetEnvIf - evaluate and set environment variables as nginx variables
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/* Set or clear an nginx variable given its case-preserving name.
+ * On set, env_value is the new value; on unset, the variable is marked
+ * not_found so consumers see it as absent (matching Apache UnsetEnv).
+ */
+static void
+hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
+    unsigned do_unset)
+{
+    ngx_str_t                  lname;
+    ngx_uint_t                 k, hash;
+    ngx_http_variable_value_t *vv;
+
+    if (name->len == 0) return;
+
+    lname.len = name->len;
+    lname.data = ngx_pnalloc(r->pool, lname.len);
+    if (lname.data == NULL) return;
+    for (k = 0; k < lname.len; k++)
+        lname.data[k] = ngx_tolower(name->data[k]);
+
+    hash = ngx_hash_key(lname.data, lname.len);
+    vv = ngx_http_get_variable(r, &lname, hash);
+    if (vv == NULL) return;
+
+    if (do_unset) {
+        vv->valid = 0;
+        vv->not_found = 1;
+        vv->no_cacheable = 0;
+        vv->len = 0;
+        vv->data = NULL;
+    } else {
+        vv->data = value->data;
+        vv->len  = value->len;
+        vv->valid = 1;
+        vv->not_found = 0;
+        vv->no_cacheable = 0;
+    }
+}
+
+
 void
 hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h)
 {
@@ -626,7 +666,13 @@ hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h)
 
     for (i = 0; i < h->nsetenvifs; i++) {
         hta_setenvif_t *se = &h->setenvifs[i];
-        ngx_str_t test_val = ngx_null_string;
+        ngx_str_t       test_val = ngx_null_string;
+
+        /* SetEnv / UnsetEnv: no regex, apply unconditionally */
+        if (se->unconditional) {
+            hta_assign_env(r, &se->env_name, &se->env_value, se->unset);
+            continue;
+        }
 
         /* get attribute value */
         if (ngx_strcasecmp(se->attribute.data,
@@ -686,30 +732,161 @@ hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h)
         }
 
         /* match regex against attribute value */
-        if (se->regex && test_val.len > 0) {
-            if (ngx_regex_exec(se->regex, &test_val, NULL, 0) >= 0) {
-                /* set the nginx variable */
-                ngx_str_t vname;
-                vname.len = se->env_name.len;
-                vname.data = ngx_pnalloc(r->pool, vname.len);
-                if (vname.data) {
-                    ngx_uint_t                 k;
-                    ngx_uint_t                 hash;
-                    ngx_http_variable_value_t *vv;
+        if (se->regex && test_val.len > 0
+            && ngx_regex_exec(se->regex, &test_val, NULL, 0) >= 0)
+        {
+            hta_assign_env(r, &se->env_name, &se->env_value, se->unset);
+        }
+    }
+}
 
-                    for (k = 0; k < vname.len; k++)
-                        vname.data[k] = ngx_tolower(se->env_name.data[k]);
-                    hash = ngx_hash_key(vname.data, vname.len);
-                    vv = ngx_http_get_variable(r, &vname, hash);
-                    if (vv) {
-                        vv->data = se->env_value.data;
-                        vv->len = se->env_value.len;
-                        vv->valid = 1;
-                        vv->not_found = 0;
-                        vv->no_cacheable = 0;
-                    }
-                }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * RequestHeader - modify r->headers_in for upstream consumers (fastcgi/proxy)
+ *
+ * Header lookups use ngx_strncasecmp so the source case of incoming header
+ * keys does not matter. When an indexed header pointer
+ * (r->headers_in.host/user_agent/referer) targets a removed/replaced entry
+ * we re-aim it at the live list entry so request-line consumers stay in sync.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_table_elt_t *
+hta_find_req_header(ngx_http_request_t *r, ngx_str_t *name)
+{
+    ngx_list_part_t *part = &r->headers_in.headers.part;
+    ngx_table_elt_t *elt  = part->elts;
+    ngx_uint_t       i;
+
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) return NULL;
+            part = part->next;
+            elt  = part->elts;
+            i = 0;
+        }
+        if (elt[i].hash == 0) continue;
+        if (elt[i].key.len == name->len
+            && ngx_strncasecmp(elt[i].key.data, name->data, name->len) == 0)
+        {
+            return &elt[i];
+        }
+    }
+}
+
+/* Repoint r->headers_in.<known field> pointer to a live list entry (or NULL
+ * if removed). Only matters for headers nginx indexes; unknown headers do
+ * not need fixup. */
+static void
+hta_repoint_indexed(ngx_http_request_t *r, ngx_str_t *name,
+    ngx_table_elt_t *new_elt)
+{
+    if (name->len == 4
+        && ngx_strncasecmp(name->data, (u_char *)"Host", 4) == 0)
+    {
+        r->headers_in.host = new_elt;
+    } else if (name->len == 7
+        && ngx_strncasecmp(name->data, (u_char *)"Referer", 7) == 0)
+    {
+        r->headers_in.referer = new_elt;
+    } else if (name->len == 10
+        && ngx_strncasecmp(name->data, (u_char *)"User-Agent", 10) == 0)
+    {
+        r->headers_in.user_agent = new_elt;
+    } else if (name->len == 13
+        && ngx_strncasecmp(name->data, (u_char *)"Authorization", 13) == 0)
+    {
+        r->headers_in.authorization = new_elt;
+    } else if (name->len == 6
+        && ngx_strncasecmp(name->data, (u_char *)"Cookie", 6) == 0)
+    {
+#if (nginx_version >= 1023000)
+        r->headers_in.cookie = new_elt;
+#else
+        /* older nginx kept cookies in a list (headers_in.cookies); we leave
+         * that array intact and only mark dead entries via hash=0 */
+        (void) new_elt;
+#endif
+    }
+}
+
+void
+hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
+{
+    ngx_uint_t       i;
+    hta_header_t    *hd;
+    ngx_table_elt_t *elt;
+
+    if (h->nreq_headers == 0) return;
+
+    for (i = 0; i < h->nreq_headers; i++) {
+        hd = &h->req_headers[i];
+
+        switch (hd->action) {
+        case HTA_HDR_UNSET:
+            elt = hta_find_req_header(r, &hd->name);
+            while (elt != NULL) {
+                elt->hash = 0;
+                elt->value.len = 0;
+                elt = hta_find_req_header(r, &hd->name);
             }
+            hta_repoint_indexed(r, &hd->name, NULL);
+            break;
+
+        case HTA_HDR_SET:
+            /* drop all existing copies, then add fresh */
+            elt = hta_find_req_header(r, &hd->name);
+            while (elt != NULL) {
+                elt->hash = 0;
+                elt->value.len = 0;
+                elt = hta_find_req_header(r, &hd->name);
+            }
+            /* FALLTHROUGH */
+            /* fall through */
+        case HTA_HDR_ADD:
+        case HTA_HDR_APPEND:
+            elt = ngx_list_push(&r->headers_in.headers);
+            if (elt == NULL) return;
+            ngx_memzero(elt, sizeof(ngx_table_elt_t));
+            elt->key   = hd->name;
+            elt->value = hd->value;
+            elt->hash  = 1;
+            /* nginx hashes lowercase header names for indexed lookups */
+            elt->lowcase_key = ngx_pnalloc(r->pool, hd->name.len);
+            if (elt->lowcase_key) {
+                ngx_uint_t k;
+                for (k = 0; k < hd->name.len; k++)
+                    elt->lowcase_key[k] = ngx_tolower(hd->name.data[k]);
+            }
+            hta_repoint_indexed(r, &hd->name, elt);
+            break;
+
+        case HTA_HDR_MERGE: {
+            /* merge: if entry exists and already contains value, skip; else
+             * append a fresh entry like APPEND */
+            ngx_table_elt_t *existing = hta_find_req_header(r, &hd->name);
+            if (existing
+                && hd->value.len > 0
+                && existing->value.len >= hd->value.len
+                && ngx_strnstr(existing->value.data,
+                       (char *)hd->value.data, existing->value.len) != NULL)
+            {
+                break;
+            }
+            elt = ngx_list_push(&r->headers_in.headers);
+            if (elt == NULL) return;
+            ngx_memzero(elt, sizeof(ngx_table_elt_t));
+            elt->key   = hd->name;
+            elt->value = hd->value;
+            elt->hash  = 1;
+            elt->lowcase_key = ngx_pnalloc(r->pool, hd->name.len);
+            if (elt->lowcase_key) {
+                ngx_uint_t k;
+                for (k = 0; k < hd->name.len; k++)
+                    elt->lowcase_key[k] = ngx_tolower(hd->name.data[k]);
+            }
+            hta_repoint_indexed(r, &hd->name, elt);
+            break;
+        }
         }
     }
 }

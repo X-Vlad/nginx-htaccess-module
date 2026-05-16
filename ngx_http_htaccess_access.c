@@ -8,6 +8,8 @@
 #include "ngx_http_htaccess_module.h"
 #include <crypt.h>
 #include <arpa/inet.h>
+#include <ngx_md5.h>
+#include <ngx_sha1.h>
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -23,30 +25,211 @@ hta_secure_zero(void *ptr, size_t len)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Constant-time string comparison - prevents timing attacks on passwords
+ * Constant-time byte buffer comparison (no NUL-terminator assumption)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static ngx_int_t
-hta_constant_time_strcmp(const u_char *a, const u_char *b)
+hta_constant_time_memcmp(const u_char *a, const u_char *b, size_t n)
 {
-    size_t alen, blen, i;
     u_char diff = 0;
+    size_t i;
+    for (i = 0; i < n; i++) diff |= a[i] ^ b[i];
+    return diff != 0;
+}
 
-    alen = ngx_strlen(a);
-    blen = ngx_strlen(b);
 
-    /* length mismatch - still compare full length to avoid timing leak */
-    if (alen != blen) {
-        /* compare against 'a' length to avoid revealing length difference */
-        for (i = 0; i < alen; i++)
-            diff |= a[i] ^ b[i % (blen ? blen : 1)];
-        return 1;  /* not equal */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Apache APR1 MD5 crypt - $apr1$<salt>$<hash>
+ *
+ * Apache's variant of FreeBSD md5_crypt. The salt is at most 8 chars.
+ * Reference: Apache's apr_md5_encode (apr-util crypt/apr_md5.c).
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* APR1 uses a custom base64 alphabet (different ordering than RFC 4648) */
+static const u_char hta_apr1_b64[] =
+    "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+static void
+hta_apr1_to64(u_char *dst, ngx_uint_t v, ngx_int_t n)
+{
+    while (--n >= 0) {
+        *dst++ = hta_apr1_b64[v & 0x3F];
+        v >>= 6;
+    }
+}
+
+/* Compute APR1 hash. Output: 22-char base64 portion (after "$apr1$<salt>$"). */
+static void
+hta_apr1_crypt(const u_char *pw, size_t pwlen,
+               const u_char *salt, size_t saltlen,
+               u_char out[22])
+{
+    ngx_md5_t ctx, ctx1;
+    u_char    final[16];
+    ngx_int_t i;
+    size_t    pl;
+    u_char   *p;
+
+    if (saltlen > 8) saltlen = 8;
+
+    /* "Then something really weird ..." - Poul-Henning Kamp's words */
+    ngx_md5_init(&ctx);
+    ngx_md5_update(&ctx, pw, pwlen);
+    ngx_md5_update(&ctx, (u_char *) "$apr1$", 6);
+    ngx_md5_update(&ctx, salt, saltlen);
+
+    /* inner context: pw + salt + pw */
+    ngx_md5_init(&ctx1);
+    ngx_md5_update(&ctx1, pw, pwlen);
+    ngx_md5_update(&ctx1, salt, saltlen);
+    ngx_md5_update(&ctx1, pw, pwlen);
+    ngx_md5_final(final, &ctx1);
+
+    /* mix `final` into ctx in 16-byte chunks */
+    for (pl = pwlen; pl > 0; pl -= (pl > 16 ? 16 : pl))
+        ngx_md5_update(&ctx, final, pl > 16 ? 16 : pl);
+
+    /* zero the password mixin slot */
+    ngx_memzero(final, sizeof(final));
+
+    /* bitwise weirdness: for each bit of pwlen, add a byte */
+    for (i = (ngx_int_t) pwlen; i != 0; i >>= 1) {
+        if (i & 1) ngx_md5_update(&ctx, final, 1);
+        else       ngx_md5_update(&ctx, pw,    1);
     }
 
-    for (i = 0; i < alen; i++)
-        diff |= a[i] ^ b[i];
+    ngx_md5_final(final, &ctx);
 
-    return diff != 0;
+    /* 1000 rounds of stirring */
+    for (i = 0; i < 1000; i++) {
+        ngx_md5_init(&ctx1);
+        if (i & 1) ngx_md5_update(&ctx1, pw, pwlen);
+        else       ngx_md5_update(&ctx1, final, 16);
+        if (i % 3) ngx_md5_update(&ctx1, salt, saltlen);
+        if (i % 7) ngx_md5_update(&ctx1, pw, pwlen);
+        if (i & 1) ngx_md5_update(&ctx1, final, 16);
+        else       ngx_md5_update(&ctx1, pw, pwlen);
+        ngx_md5_final(final, &ctx1);
+    }
+
+    /* encode the 16-byte digest in the canonical APR1 ordering */
+    p = out;
+    hta_apr1_to64(p, (final[ 0]<<16)|(final[ 6]<<8)|final[12], 4); p += 4;
+    hta_apr1_to64(p, (final[ 1]<<16)|(final[ 7]<<8)|final[13], 4); p += 4;
+    hta_apr1_to64(p, (final[ 2]<<16)|(final[ 8]<<8)|final[14], 4); p += 4;
+    hta_apr1_to64(p, (final[ 3]<<16)|(final[ 9]<<8)|final[15], 4); p += 4;
+    hta_apr1_to64(p, (final[ 4]<<16)|(final[10]<<8)|final[ 5], 4); p += 4;
+    hta_apr1_to64(p, final[11], 2);
+
+    hta_secure_zero(final, sizeof(final));
+    hta_secure_zero(&ctx,  sizeof(ctx));
+    hta_secure_zero(&ctx1, sizeof(ctx1));
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Dispatch password verification by hash format.
+ *
+ * Recognized formats (Apache htpasswd-compatible):
+ *   $apr1$<salt>$<hash>   - Apache MD5 (custom impl, always available)
+ *   $2a$ / $2b$ / $2y$    - bcrypt (via system crypt_r)
+ *   $1$ / $5$ / $6$       - glibc MD5 / SHA-256 / SHA-512 (via crypt_r)
+ *   {SHA}<base64>         - base64(SHA-1(plain))
+ *   13-byte string        - legacy DES crypt (via crypt_r)
+ *
+ * Returns NGX_OK on match, NGX_DECLINED on mismatch, NGX_ERROR on internal
+ * failure.
+ *
+ * All password bytes and intermediate buffers are zeroed before return.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_verify_password(u_char *plain, size_t plain_len,
+                    u_char *hash,  size_t hash_len)
+{
+    ngx_int_t result = NGX_DECLINED;
+
+    if (hash_len == 0) return NGX_DECLINED;
+
+    /* ---- {SHA} ---- */
+    if (hash_len >= 5 && ngx_strncmp(hash, "{SHA}", 5) == 0) {
+        u_char    digest[20];
+        u_char    expected[20];
+        ngx_str_t enc, dec;
+        ngx_sha1_t sha;
+
+        ngx_sha1_init(&sha);
+        ngx_sha1_update(&sha, plain, plain_len);
+        ngx_sha1_final(digest, &sha);
+
+        enc.data = hash + 5;
+        enc.len  = hash_len - 5;
+        dec.data = expected;
+        dec.len  = sizeof(expected);
+        if (ngx_decode_base64(&dec, &enc) != NGX_OK
+            || dec.len != sizeof(expected))
+        {
+            hta_secure_zero(digest, sizeof(digest));
+            return NGX_DECLINED;
+        }
+        if (hta_constant_time_memcmp(digest, expected, sizeof(digest)) == 0)
+            result = NGX_OK;
+        hta_secure_zero(digest,   sizeof(digest));
+        hta_secure_zero(expected, sizeof(expected));
+        return result;
+    }
+
+    /* ---- $apr1$<salt>$<hash> ---- */
+    if (hash_len > 6 && ngx_strncmp(hash, "$apr1$", 6) == 0) {
+        u_char    *salt = hash + 6;
+        u_char    *salt_end = (u_char *) ngx_strchr(salt, '$');
+        size_t     salt_len;
+        u_char     computed[22];
+        u_char    *expected_hash;
+        size_t     expected_len;
+
+        if (salt_end == NULL || salt_end >= hash + hash_len) return NGX_DECLINED;
+        salt_len = salt_end - salt;
+        if (salt_len > 8) salt_len = 8;
+        expected_hash = salt_end + 1;
+        expected_len  = (hash + hash_len) - expected_hash;
+        if (expected_len != 22) return NGX_DECLINED;
+
+        hta_apr1_crypt(plain, plain_len, salt, salt_len, computed);
+        if (hta_constant_time_memcmp(computed, expected_hash, 22) == 0)
+            result = NGX_OK;
+        hta_secure_zero(computed, sizeof(computed));
+        return result;
+    }
+
+    /* ---- crypt() compatible: $1$, $5$, $6$, $2a$/$2b$/$2y$, DES ---- */
+    {
+        u_char            pbuf[256];
+        u_char            hbuf[256];
+        struct crypt_data cd;
+        char             *cr;
+
+        if (plain_len >= sizeof(pbuf)) return NGX_DECLINED;
+        if (hash_len  >= sizeof(hbuf)) return NGX_DECLINED;
+
+        ngx_memcpy(pbuf, plain, plain_len);
+        pbuf[plain_len] = '\0';
+        ngx_memcpy(hbuf, hash, hash_len);
+        hbuf[hash_len] = '\0';
+
+        cd.initialized = 0;
+        cr = crypt_r((char *) pbuf, (char *) hbuf, &cd);
+        if (cr != NULL
+            && ngx_strlen(cr) == hash_len
+            && hta_constant_time_memcmp((u_char *) cr, hbuf, hash_len) == 0)
+        {
+            result = NGX_OK;
+        }
+        hta_secure_zero(pbuf, sizeof(pbuf));
+        hta_secure_zero(hbuf, sizeof(hbuf));
+        hta_secure_zero(&cd,  sizeof(cd));
+        return result;
+    }
 }
 
 
@@ -338,6 +521,53 @@ hta_files_match(hta_files_block_t *fb, ngx_str_t *basename)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * SSLRequireSSL / SSLRequire - require HTTPS connection.
+ *
+ * Also accepts X-Forwarded-Proto: https when behind a TLS-terminating proxy.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+ngx_int_t
+hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *hdr;
+    ngx_uint_t        i;
+
+    if (!h->ssl_required) return NGX_OK;
+
+#if (NGX_HTTP_SSL)
+    if (r->connection->ssl) return NGX_OK;
+#endif
+
+    /* honor X-Forwarded-Proto: https for deployments behind a TLS proxy */
+    part = &r->headers_in.headers.part;
+    hdr  = part->elts;
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) break;
+            part = part->next;
+            hdr  = part->elts;
+            i = 0;
+        }
+        if (hdr[i].key.len == sizeof("X-Forwarded-Proto") - 1
+            && ngx_strncasecmp(hdr[i].key.data,
+                (u_char *)"X-Forwarded-Proto",
+                sizeof("X-Forwarded-Proto") - 1) == 0
+            && hdr[i].value.len == 5
+            && ngx_strncasecmp(hdr[i].value.data,
+                (u_char *)"https", 5) == 0)
+        {
+            return NGX_OK;
+        }
+    }
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+        "htaccess: SSLRequireSSL denied non-HTTPS request");
+    return NGX_HTTP_FORBIDDEN;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Check <Files>/<FilesMatch> block access control
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -429,13 +659,126 @@ hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h)
         tmp->auth_valid_user = fb->auth_valid_user;
         tmp->auth_name = fb->auth_name;
         tmp->auth_user_file = fb->auth_user_file;
+        tmp->auth_group_file = fb->auth_group_file;
         tmp->nauth_users = fb->nauth_users;
         for (j = 0; j < fb->nauth_users && j < HTA_MAX_USERS; j++)
             tmp->auth_users[j] = fb->auth_users[j];
+        tmp->nrequire_groups = fb->nrequire_groups;
+        for (j = 0; j < fb->nrequire_groups && j < HTA_MAX_GROUPS; j++)
+            tmp->require_groups[j] = fb->require_groups[j];
 
         rc = hta_check_auth(r, tmp);
         if (rc != NGX_OK) return rc;
         }
+    }
+    return NGX_OK;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Does the request method match the limit block?
+ *
+ * <Limit M1 M2 ...>     matches iff r->method is in {M1, M2, ...}
+ * <LimitExcept M1 M2>   matches iff r->method is NOT in {M1, M2, ...}
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_limit_matches(ngx_http_request_t *r, hta_limit_block_t *lb)
+{
+    ngx_uint_t hit = (r->method & lb->methods) != 0;
+    return lb->is_except ? !hit : hit;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Check <Limit>/<LimitExcept> block access control (Order/Allow/Deny/Require)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+ngx_int_t
+hta_check_limit_access(ngx_http_request_t *r, hta_parsed_t *h)
+{
+    ngx_uint_t i, j;
+    ngx_int_t  allowed;
+    ngx_str_t  cip;
+
+    if (h->nlimit_blocks == 0) return NGX_OK;
+
+    cip = r->connection->addr_text;
+
+    for (i = 0; i < h->nlimit_blocks; i++) {
+        hta_limit_block_t *lb = &h->limit_blocks[i];
+
+        if (!hta_limit_matches(r, lb)) continue;
+
+        if (lb->require_denied) return NGX_HTTP_FORBIDDEN;
+        if (lb->require_granted) continue;
+
+        if (lb->has_acl) {
+            if (lb->access_order == HTA_ORDER_DENY_ALLOW) {
+                allowed = 1;
+                for (j = 0; j < lb->nacl; j++)
+                    if (!lb->acl[j].is_allow
+                        && hta_match_ip(&cip, &lb->acl[j].value))
+                        allowed = 0;
+                for (j = 0; j < lb->nacl; j++)
+                    if (lb->acl[j].is_allow
+                        && hta_match_ip(&cip, &lb->acl[j].value))
+                        allowed = 1;
+            } else {
+                allowed = 0;
+                for (j = 0; j < lb->nacl; j++)
+                    if (lb->acl[j].is_allow
+                        && hta_match_ip(&cip, &lb->acl[j].value))
+                        allowed = 1;
+                for (j = 0; j < lb->nacl; j++)
+                    if (!lb->acl[j].is_allow
+                        && hta_match_ip(&cip, &lb->acl[j].value))
+                        allowed = 0;
+            }
+            if (!allowed) return NGX_HTTP_FORBIDDEN;
+        }
+    }
+    return NGX_OK;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Check <Limit>/<LimitExcept> block authentication
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+ngx_int_t
+hta_check_limit_auth(ngx_http_request_t *r, hta_parsed_t *h)
+{
+    ngx_uint_t i;
+
+    if (h->nlimit_blocks == 0) return NGX_OK;
+
+    for (i = 0; i < h->nlimit_blocks; i++) {
+        hta_limit_block_t *lb = &h->limit_blocks[i];
+        hta_parsed_t      *tmp;
+        ngx_uint_t         j;
+        ngx_int_t          rc;
+
+        if (!hta_limit_matches(r, lb)) continue;
+        if (!lb->auth_basic) continue;
+
+        /* delegate to the standard auth path via a temporary hta_parsed_t */
+        tmp = ngx_pcalloc(r->pool, sizeof(hta_parsed_t));
+        if (tmp == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        tmp->auth_basic = lb->auth_basic;
+        tmp->auth_valid_user = lb->auth_valid_user;
+        tmp->auth_name = lb->auth_name;
+        tmp->auth_user_file = lb->auth_user_file;
+        tmp->auth_group_file = lb->auth_group_file;
+        tmp->nauth_users = lb->nauth_users;
+        for (j = 0; j < lb->nauth_users && j < HTA_MAX_USERS; j++)
+            tmp->auth_users[j] = lb->auth_users[j];
+        tmp->nrequire_groups = lb->nrequire_groups;
+        for (j = 0; j < lb->nrequire_groups && j < HTA_MAX_GROUPS; j++)
+            tmp->require_groups[j] = lb->require_groups[j];
+
+        rc = hta_check_auth(r, tmp);
+        if (rc != NGX_OK) return rc;
     }
     return NGX_OK;
 }
@@ -447,6 +790,7 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
     ngx_str_t  enc, dec;
     u_char    *colon;
     ngx_str_t  user, pass;
+    ngx_int_t  result;
 
     if (!h->auth_basic) return NGX_OK;
 
@@ -477,21 +821,37 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
     dec.len = ngx_base64_decoded_length(enc.len);
     dec.data = ngx_pnalloc(r->pool, dec.len + 1);
     if (dec.data == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    if (ngx_decode_base64(&dec, &enc) != NGX_OK) return NGX_HTTP_UNAUTHORIZED;
+    if (ngx_decode_base64(&dec, &enc) != NGX_OK) {
+        hta_secure_zero(dec.data, dec.len + 1);
+        return NGX_HTTP_UNAUTHORIZED;
+    }
     dec.data[dec.len] = '\0';
 
     colon = (u_char *)ngx_strchr(dec.data, ':');
-    if (colon == NULL) return NGX_HTTP_UNAUTHORIZED;
+    if (colon == NULL) {
+        hta_secure_zero(dec.data, dec.len + 1);
+        return NGX_HTTP_UNAUTHORIZED;
+    }
 
     user.data = dec.data; user.len = colon - dec.data;
     pass.data = colon + 1; pass.len = dec.len - user.len - 1;
+
+    /* defensive cap: APR1's bit-shift loop assumes pwlen fits in ngx_int_t */
+    if (pass.len > 1024) {
+        hta_secure_zero(dec.data, dec.len + 1);
+        return NGX_HTTP_UNAUTHORIZED;
+    }
+
+    /* Anything below this point exits via `goto done` so the decoded
+     * "user:pass" plaintext gets zeroed on every path. */
+    result = NGX_OK;
 
     /* verify against htpasswd file */
     if (h->auth_user_file.len == 0) {
         /* no password file configured - cannot validate */
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
             "htaccess: AuthUserFile not set but auth required");
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
     }
 
     /* Security: reject path traversal in AuthUserFile */
@@ -507,7 +867,7 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
                     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                         "htaccess: path traversal in AuthUserFile \"%V\"",
                         &h->auth_user_file);
-                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
                 }
             }
             pp++;
@@ -523,7 +883,9 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
         mc = ngx_http_get_module_main_conf(r, ngx_http_htaccess_module);
         fbuf = hta_passwd_get(mc, &h->auth_user_file, &fsz,
                                r->connection->log);
-        if (fbuf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        if (fbuf == NULL) {
+            result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
+        }
 
         found = 0;
         line = (u_char *)fbuf;
@@ -542,37 +904,20 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
                 {
                     u_char    *hash = fc + 1;
                     ngx_uint_t hlen = eol - hash;
-                    u_char     hbuf[256];
 
                     while (hlen > 0 && (hash[hlen-1] == '\r'
                                         || hash[hlen-1] == '\n'))
                         hlen--;
-                    if (hlen < sizeof(hbuf)) {
-                        u_char           pbuf[256];
-                        struct crypt_data cd;
-
-                        ngx_memcpy(hbuf, hash, hlen); hbuf[hlen] = '\0';
-                        if (pass.len < sizeof(pbuf)) {
-                            char *cr;
-                            ngx_memcpy(pbuf, pass.data, pass.len);
-                            pbuf[pass.len] = '\0';
-                            cd.initialized = 0;
-                            cr = crypt_r((char *)pbuf, (char *)hbuf, &cd);
-                            if (cr && hta_constant_time_strcmp(
-                                          (u_char *)cr, hbuf) == 0)
-                                found = 1;
-                            /* zero sensitive data */
-                            hta_secure_zero(pbuf, sizeof(pbuf));
-                            hta_secure_zero(&cd, sizeof(cd));
-                        }
-                    }
+                    if (hta_verify_password(pass.data, pass.len,
+                                            hash, hlen) == NGX_OK)
+                        found = 1;
                     break;
                 }
             }
             line = eol + 1;
         }
 
-        if (!found) return NGX_HTTP_UNAUTHORIZED;
+        if (!found) { result = NGX_HTTP_UNAUTHORIZED; goto done; }
     }
 
     /* check Require user list */
@@ -584,8 +929,120 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
                 ngx_strncmp(h->auth_users[i].data, user.data, user.len) == 0)
             { ok = 1; break; }
         }
-        if (!ok) return NGX_HTTP_UNAUTHORIZED;
+        if (!ok) { result = NGX_HTTP_UNAUTHORIZED; goto done; }
     }
 
-    return NGX_OK;
+    /* check Require group list against AuthGroupFile */
+    if (h->nrequire_groups > 0) {
+        if (h->auth_group_file.len == 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "htaccess: Require group used without AuthGroupFile");
+            result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
+        }
+
+        /* path-traversal guard, mirrors the AuthUserFile check above */
+        {
+            u_char *pp, *pe;
+            pp = h->auth_group_file.data;
+            pe = pp + h->auth_group_file.len;
+            while (pp < pe) {
+                if (*pp == '.' && pp + 1 < pe && *(pp + 1) == '.'
+                    && (pp == h->auth_group_file.data || *(pp - 1) == '/')
+                    && (pp + 2 >= pe || *(pp + 2) == '/'))
+                {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "htaccess: path traversal in AuthGroupFile \"%V\"",
+                        &h->auth_group_file);
+                    result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
+                }
+                pp++;
+            }
+        }
+
+        {
+            ngx_http_hta_main_conf_t *mc;
+            const u_char             *gbuf;
+            size_t                    gsz;
+            u_char                   *line, *gend;
+            unsigned                  in_group = 0;
+
+            mc = ngx_http_get_module_main_conf(r, ngx_http_htaccess_module);
+            gbuf = hta_passwd_get(mc, &h->auth_group_file, &gsz,
+                                   r->connection->log);
+            if (gbuf == NULL) {
+                result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
+            }
+
+            line = (u_char *)gbuf;
+            gend = (u_char *)gbuf + gsz;
+
+            /* htgroup format (one line per group):
+             *   groupname: user1 user2 user3
+             */
+            while (line < gend && !in_group) {
+                u_char *eol = (u_char *)ngx_strchr(line, '\n');
+                u_char *colon;
+                ngx_str_t gname;
+
+                if (eol == NULL || eol > gend) eol = gend;
+                colon = (u_char *)ngx_strchr(line, ':');
+                if (colon == NULL || colon >= eol) { line = eol + 1; continue; }
+
+                gname.data = line;
+                gname.len  = colon - line;
+                /* trim trailing spaces on the group name */
+                while (gname.len > 0 && (gname.data[gname.len - 1] == ' '
+                                         || gname.data[gname.len - 1] == '\t'))
+                    gname.len--;
+
+                /* is this one of our required groups? */
+                {
+                    ngx_uint_t gi;
+                    unsigned   matches_req = 0;
+                    for (gi = 0; gi < h->nrequire_groups; gi++) {
+                        if (h->require_groups[gi].len == gname.len
+                            && ngx_strncmp(h->require_groups[gi].data,
+                                           gname.data, gname.len) == 0)
+                        {
+                            matches_req = 1; break;
+                        }
+                    }
+                    if (!matches_req) { line = eol + 1; continue; }
+                }
+
+                /* walk the member list */
+                {
+                    u_char *mp = colon + 1, *mend = eol;
+                    while (mp < mend) {
+                        u_char *ms;
+                        ngx_uint_t mlen;
+
+                        while (mp < mend && (*mp == ' ' || *mp == '\t'
+                                             || *mp == '\r')) mp++;
+                        if (mp >= mend) break;
+                        ms = mp;
+                        while (mp < mend && *mp != ' ' && *mp != '\t'
+                               && *mp != '\r') mp++;
+                        mlen = mp - ms;
+                        if (mlen == user.len
+                            && ngx_strncmp(ms, user.data, user.len) == 0)
+                        {
+                            in_group = 1; break;
+                        }
+                    }
+                }
+                line = eol + 1;
+            }
+
+            if (!in_group) {
+                result = NGX_HTTP_UNAUTHORIZED; goto done;
+            }
+        }
+    }
+
+done:
+    /* zero the decoded "user:pass" plaintext so it does not linger in
+     * the request pool until the request is destroyed */
+    hta_secure_zero(dec.data, dec.len + 1);
+    return result;
 }

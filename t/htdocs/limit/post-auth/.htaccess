@@ -1,0 +1,7 @@
+# POST and PUT require auth; GET stays public
+<Limit POST PUT>
+    AuthType Basic
+    AuthName "Mutations"
+    AuthUserFile __HTDOCS_ROOT__/auth/.htpasswd
+    Require valid-user
+</Limit>

@@ -1,0 +1,6 @@
+# Modify incoming request headers
+RequestHeader set   X-Injected      "from-htaccess"
+RequestHeader set   X-Forwarded-Proto "https"
+RequestHeader unset X-Drop-Me
+RequestHeader add   X-Multi         "one"
+RequestHeader add   X-Multi         "two"
