@@ -1,11 +1,35 @@
-# ngx_http_htaccess_module
+# nginx htaccess module (ngx_http_htaccess_module)
+
+Apache-compatible `.htaccess` and `mod_rewrite` support for nginx.
+
+Native C nginx module providing per-directory `.htaccess` processing, rewrite rules, authentication, access control, and shared hosting compatibility.
+
+`ngx_http_htaccess_module` enables nginx to read and apply Apache-compatible `.htaccess` files, including rewrite rules, authentication, access control, and per-directory configuration.
+
+Designed for shared hosting providers migrating from Apache HTTP Server or LiteSpeed to nginx without rewriting customer `.htaccess` files.
 
 [![License: BSD-2-Clause](https://img.shields.io/badge/License-BSD_2--Clause-blue.svg)](https://opensource.org/licenses/BSD-2-Clause)
 [![nginx](https://img.shields.io/badge/nginx-1.24+-green.svg)](https://nginx.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)]()
 [![Language](https://img.shields.io/badge/language-C-orange.svg)]()
 
-A native C module for nginx that provides Apache-compatible `.htaccess` file support. Zero dependencies beyond PCRE and libc. No Lua, no OpenResty, no external interpreters.
+---
+
+## Features
+
+- Apache `.htaccess` support for nginx
+- Apache-compatible `mod_rewrite`
+- Per-directory rewrite rules
+- `.htaccess` rewrite rules
+- `.htpasswd` authentication
+- Shared hosting `.htaccess` compatibility
+- Automatic reload via inotify
+- Native C nginx module
+- No Lua
+- No OpenResty
+- Linux only
+
+---
 
 > **Platform:** Linux only. The module uses `inotify` for file change monitoring and `crypt()` from glibc for password hashing. Windows and macOS are not supported.
 
