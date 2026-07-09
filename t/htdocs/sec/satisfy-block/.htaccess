@@ -1,0 +1,10 @@
+AuthType Basic
+AuthName "Restricted"
+AuthUserFile __HTDOCS_ROOT__/auth/.htpasswd
+Satisfy Any
+Order deny,allow
+Deny from all
+Allow from 127.0.0.1
+<Limit GET>
+Require valid-user
+</Limit>

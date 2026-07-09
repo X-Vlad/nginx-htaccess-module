@@ -1,0 +1,3 @@
+RewriteEngine On
+RewriteCond %{REQUEST_SCHEME} ^http$
+RewriteRule . /is-http [R=302,L]

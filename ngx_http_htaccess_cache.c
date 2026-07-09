@@ -81,6 +81,16 @@ hta_cache_put(ngx_http_hta_main_conf_t *mc, u_char *path, ngx_uint_t plen,
             }
             mc->cache[i].parsed = parsed;
             mc->cache[i].mtime  = parsed ? parsed->mtime : 0;
+            /* Re-arm the inotify watch. After the first invalidation the watch
+             * descriptor was cleared (wd=-1); without re-adding it here only the
+             * first edit per file would ever be detected and later edits would
+             * serve stale config until restart. inotify_add_watch on the same
+             * path returns the existing wd for a still-watched file, or a fresh
+             * one after IN_DELETE_SELF/IN_MOVE_SELF. */
+            if (mc->inotify_fd != -1 && parsed && mc->cache[i].wd == -1) {
+                mc->cache[i].wd = inotify_add_watch(mc->inotify_fd,
+                    (char *) path, IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF);
+            }
             return;
         }
     }

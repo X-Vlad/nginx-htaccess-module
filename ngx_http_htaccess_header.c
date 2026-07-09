@@ -201,6 +201,26 @@ hta_header_filter(ngx_http_request_t *r)
         for (hi = 0; hi < h->nheaders; hi++) {
             hd = &h->headers[hi];
 
+            /* "env=[!]VAR" condition: apply the header only when the nginx
+             * variable is set (or unset, for env=!VAR) */
+            if (hd->cond_env.len > 0) {
+                ngx_str_t                  lname;
+                ngx_uint_t                 k, hash;
+                ngx_http_variable_value_t *vv;
+                unsigned                   is_set = 0;
+
+                lname.len  = hd->cond_env.len;
+                lname.data = ngx_pnalloc(r->pool, lname.len);
+                if (lname.data) {
+                    for (k = 0; k < lname.len; k++)
+                        lname.data[k] = ngx_tolower(hd->cond_env.data[k]);
+                    hash = ngx_hash_key(lname.data, lname.len);
+                    vv = ngx_http_get_variable(r, &lname, hash);
+                    is_set = (vv && !vv->not_found && vv->len > 0);
+                }
+                if (hd->cond_negate ? is_set : !is_set) continue;
+            }
+
             switch (hd->action) {
             case HTA_HDR_SET:
                 hta_remove_header(r, &hd->name);

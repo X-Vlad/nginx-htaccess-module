@@ -61,7 +61,9 @@ RUN HTDOCS=/tests/t/htdocs \
                 "$HTDOCS/satisfy/strict/.htaccess" \
                 "$HTDOCS/auth-sha/.htaccess" \
                 "$HTDOCS/auth-apr1/.htaccess" \
-                "$HTDOCS/groups/.htaccess"; do \
+                "$HTDOCS/groups/.htaccess" \
+                "$HTDOCS/sec/inherit/.htaccess" \
+                "$HTDOCS/sec/satisfy-block/.htaccess"; do \
         [ -f "$f" ] && sed -i "s|__HTDOCS_ROOT__|${HTDOCS}|g" "$f"; \
     done \
     && chmod +x /tests/t/run_tests.sh /tests/t/helpers.sh /tests/t/*.t.sh

@@ -109,7 +109,9 @@ for f in "${HTDOCS_ROOT}/auth/.htaccess" \
          "${HTDOCS_ROOT}/satisfy/strict/.htaccess" \
          "${HTDOCS_ROOT}/auth-sha/.htaccess" \
          "${HTDOCS_ROOT}/auth-apr1/.htaccess" \
-         "${HTDOCS_ROOT}/groups/.htaccess"; do
+         "${HTDOCS_ROOT}/groups/.htaccess" \
+         "${HTDOCS_ROOT}/sec/inherit/.htaccess" \
+         "${HTDOCS_ROOT}/sec/satisfy-block/.htaccess"; do
     [ -f "$f" ] && sed -i "s|__HTDOCS_ROOT__|${HTDOCS_ROOT}|g" "$f"
 done
 

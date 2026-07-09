@@ -312,47 +312,154 @@ hta_match_ip(ngx_str_t *client, ngx_str_t *pat)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Access control - Order/Allow/Deny + Require
+ * Is the client connecting from the local machine (Require local)?
+ * Matches IPv4 loopback (127.0.0.0/8), IPv6 loopback (::1) and unix sockets.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_ip_is_local(ngx_str_t *cip)
+{
+    if (cip->len >= 4 && ngx_strncmp(cip->data, "127.", 4) == 0) return 1;
+    if (cip->len == 3 && ngx_strncmp(cip->data, "::1", 3) == 0) return 1;
+    if (cip->len >= 5 && ngx_strncmp(cip->data, "unix:", 5) == 0) return 1;
+    return 0;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Is an nginx environment variable set and non-empty? Backs "env=" tokens in
+ * Allow/Deny and "Require env". The variable must be declared in nginx.conf
+ * (set/map) and is typically populated by SetEnvIf/BrowserMatch.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_env_is_set(ngx_http_request_t *r, ngx_str_t *name)
+{
+    ngx_str_t                  lname;
+    ngx_uint_t                 k, hash;
+    ngx_http_variable_value_t *vv;
+
+    if (name->len == 0) return 0;
+
+    lname.len  = name->len;
+    lname.data = ngx_pnalloc(r->pool, lname.len);
+    if (lname.data == NULL) return 0;
+    for (k = 0; k < lname.len; k++)
+        lname.data[k] = ngx_tolower(name->data[k]);
+
+    hash = ngx_hash_key(lname.data, lname.len);
+    vv = ngx_http_get_variable(r, &lname, hash);
+    return (vv && !vv->not_found && vv->len > 0) ? 1 : 0;
+}
+
+
+/* Match one ACL/Require entry against the client. "env=NAME" tokens test an
+ * environment variable; everything else is an IP/CIDR/prefix match. */
+static ngx_int_t
+hta_acl_entry_match(ngx_http_request_t *r, ngx_str_t *cip, hta_access_t *a)
+{
+    if (a->value.len > 4 && ngx_strncmp(a->value.data, "env=", 4) == 0) {
+        ngx_str_t name;
+        name.data = a->value.data + 4;
+        name.len  = a->value.len - 4;
+        return hta_env_is_set(r, &name);
+    }
+    return hta_match_ip(cip, &a->value);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Shared access evaluator - mod_access_compat (Allow/Deny/Order) combined with
+ * mod_authz_host style Require ip/host/env/local.
  *
- * Apache Order logic:
+ * Apache Order logic (mod_access_compat):
  *   deny,allow (default): allowed by default, deny overrides, allow overrides deny
  *   allow,deny: denied by default, allow overrides, deny overrides allow
+ *
+ * Require ip/host/env/local are authorization requirements: when present, the
+ * client MUST match at least one of them (RequireAny among themselves), else it
+ * is denied. This closes the fail-open hole where a standalone "Require ip"
+ * used to grant everyone under the default deny,allow order.
+ *
+ * "Require all granted" waives the host requirement but does NOT override an
+ * explicit Deny; "Require all denied" and unsupported Require providers fail
+ * closed.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_eval_acl(ngx_http_request_t *r, hta_access_t *acl, ngx_uint_t nacl,
+    ngx_uint_t order, unsigned has_compat, unsigned has_require_host,
+    unsigned require_local, unsigned require_failed,
+    unsigned require_granted, unsigned require_denied)
+{
+    ngx_uint_t i;
+    ngx_int_t  compat_ok, host_ok;
+    ngx_str_t  cip;
+
+    if (require_denied) return NGX_HTTP_FORBIDDEN;
+    if (require_failed) return NGX_HTTP_FORBIDDEN;
+
+    cip = r->connection->addr_text;
+
+    /* mod_access_compat Allow/Deny over non-Require entries */
+    compat_ok = 1;
+    if (has_compat) {
+        if (order == HTA_ORDER_DENY_ALLOW) {
+            compat_ok = 1;
+            for (i = 0; i < nacl; i++)
+                if (!acl[i].is_require && !acl[i].is_allow
+                    && hta_acl_entry_match(r, &cip, &acl[i]))
+                    compat_ok = 0;
+            for (i = 0; i < nacl; i++)
+                if (!acl[i].is_require && acl[i].is_allow
+                    && hta_acl_entry_match(r, &cip, &acl[i]))
+                    compat_ok = 1;
+        } else {
+            compat_ok = 0;
+            for (i = 0; i < nacl; i++)
+                if (!acl[i].is_require && acl[i].is_allow
+                    && hta_acl_entry_match(r, &cip, &acl[i]))
+                    compat_ok = 1;
+            for (i = 0; i < nacl; i++)
+                if (!acl[i].is_require && !acl[i].is_allow
+                    && hta_acl_entry_match(r, &cip, &acl[i]))
+                    compat_ok = 0;
+        }
+    }
+
+    /* Require ip/host/env/local: client must match at least one (RequireAny) */
+    host_ok = 1;
+    if (require_granted) {
+        host_ok = 1;
+    } else if (has_require_host || require_local) {
+        host_ok = 0;
+        if (require_local && hta_ip_is_local(&cip)) host_ok = 1;
+        if (!host_ok) {
+            for (i = 0; i < nacl; i++)
+                if (acl[i].is_require
+                    && hta_acl_entry_match(r, &cip, &acl[i]))
+                { host_ok = 1; break; }
+        }
+    }
+
+    return (compat_ok && host_ok) ? NGX_OK : NGX_HTTP_FORBIDDEN;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Access control - Order/Allow/Deny + Require (top-level scope)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 ngx_int_t
 hta_check_access(ngx_http_request_t *r, hta_parsed_t *h)
 {
-    ngx_uint_t i;
-    ngx_int_t  allowed;
-    ngx_str_t  cip;
-
-    if (!h->has_acl && !h->require_denied && !h->require_granted)
+    if (!h->has_acl && !h->has_require_host && !h->require_local
+        && !h->require_denied && !h->require_granted && !h->require_failed)
         return NGX_OK;
 
-    if (h->require_denied)  return NGX_HTTP_FORBIDDEN;
-    if (h->require_granted) return NGX_OK;
-
-    cip = r->connection->addr_text;
-
-    if (h->access_order == HTA_ORDER_DENY_ALLOW) {
-        allowed = 1;
-        for (i = 0; i < h->nacl; i++)
-            if (!h->acl[i].is_allow && hta_match_ip(&cip, &h->acl[i].value))
-                allowed = 0;
-        for (i = 0; i < h->nacl; i++)
-            if (h->acl[i].is_allow && hta_match_ip(&cip, &h->acl[i].value))
-                allowed = 1;
-    } else {
-        allowed = 0;
-        for (i = 0; i < h->nacl; i++)
-            if (h->acl[i].is_allow && hta_match_ip(&cip, &h->acl[i].value))
-                allowed = 1;
-        for (i = 0; i < h->nacl; i++)
-            if (!h->acl[i].is_allow && hta_match_ip(&cip, &h->acl[i].value))
-                allowed = 0;
-    }
-
-    return allowed ? NGX_OK : NGX_HTTP_FORBIDDEN;
+    return hta_eval_acl(r, h->acl, h->nacl, h->access_order,
+        h->has_acl, h->has_require_host, h->require_local, h->require_failed,
+        h->require_granted, h->require_denied);
 }
 
 
@@ -527,7 +634,7 @@ hta_files_match(hta_files_block_t *fb, ngx_str_t *basename)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 ngx_int_t
-hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h)
+hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h, ngx_uint_t trust_proxy)
 {
     ngx_list_part_t  *part;
     ngx_table_elt_t  *hdr;
@@ -538,6 +645,16 @@ hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h)
 #if (NGX_HTTP_SSL)
     if (r->connection->ssl) return NGX_OK;
 #endif
+
+    /* X-Forwarded-Proto is client-controllable, so only trust it when the
+     * operator has opted in with `htaccess_trust_proxy on;` (i.e. nginx sits
+     * behind a TLS-terminating proxy that overwrites the header). Without this
+     * a direct client could spoof https and bypass SSLRequireSSL. */
+    if (!trust_proxy) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+            "htaccess: SSLRequireSSL denied non-HTTPS request");
+        return NGX_HTTP_FORBIDDEN;
+    }
 
     /* honor X-Forwarded-Proto: https for deployments behind a TLS proxy */
     part = &r->headers_in.headers.part;
@@ -574,52 +691,29 @@ hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h)
 ngx_int_t
 hta_check_files_access(ngx_http_request_t *r, hta_parsed_t *h)
 {
-    ngx_uint_t i, j;
+    ngx_uint_t i;
     ngx_str_t  basename;
-    ngx_int_t  allowed;
-    ngx_str_t  cip;
 
     if (h->nfiles_blocks == 0) return NGX_OK;
 
     basename = hta_uri_basename(&r->uri);
     if (basename.len == 0) return NGX_OK;
 
-    cip = r->connection->addr_text;
-
     for (i = 0; i < h->nfiles_blocks; i++) {
         hta_files_block_t *fb = &h->files_blocks[i];
+        ngx_int_t          rc;
 
         if (!hta_files_match(fb, &basename)) continue;
 
-        /* Check Require all denied/granted */
-        if (fb->require_denied) return NGX_HTTP_FORBIDDEN;
-        if (fb->require_granted) continue;
+        if (!fb->has_acl && !fb->has_require_host && !fb->require_local
+            && !fb->require_denied && !fb->require_granted
+            && !fb->require_failed)
+            continue;
 
-        /* Check Order/Allow/Deny */
-        if (fb->has_acl) {
-            if (fb->access_order == HTA_ORDER_DENY_ALLOW) {
-                allowed = 1;
-                for (j = 0; j < fb->nacl; j++)
-                    if (!fb->acl[j].is_allow
-                        && hta_match_ip(&cip, &fb->acl[j].value))
-                        allowed = 0;
-                for (j = 0; j < fb->nacl; j++)
-                    if (fb->acl[j].is_allow
-                        && hta_match_ip(&cip, &fb->acl[j].value))
-                        allowed = 1;
-            } else {
-                allowed = 0;
-                for (j = 0; j < fb->nacl; j++)
-                    if (fb->acl[j].is_allow
-                        && hta_match_ip(&cip, &fb->acl[j].value))
-                        allowed = 1;
-                for (j = 0; j < fb->nacl; j++)
-                    if (!fb->acl[j].is_allow
-                        && hta_match_ip(&cip, &fb->acl[j].value))
-                        allowed = 0;
-            }
-            if (!allowed) return NGX_HTTP_FORBIDDEN;
-        }
+        rc = hta_eval_acl(r, fb->acl, fb->nacl, fb->access_order,
+            fb->has_acl, fb->has_require_host, fb->require_local,
+            fb->require_failed, fb->require_granted, fb->require_denied);
+        if (rc != NGX_OK) return rc;
     }
     return NGX_OK;
 }
@@ -642,12 +736,27 @@ hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h)
 
     for (i = 0; i < h->nfiles_blocks; i++) {
         hta_files_block_t *fb = &h->files_blocks[i];
+        unsigned           block_sets_type;
+        unsigned           eff_basic, eff_unsupported;
+        unsigned           has_req;
 
         if (!hta_files_match(fb, &basename)) continue;
-        if (!fb->auth_basic) continue;
 
-        /* Construct a temporary hta_parsed_t for auth check.
-         * Heap-allocated — hta_parsed_t is too large for stack (~50KB). */
+        /* A <Files>/<FilesMatch> block inherits AuthType/AuthName/AuthUserFile/
+         * AuthGroupFile from the enclosing scope (Apache behavior). Without this
+         * a per-file "Require valid-user"/"Require user" was silently ignored
+         * when AuthType lived at the top level (auth bypass). */
+        block_sets_type = fb->auth_basic || fb->auth_type_unsupported;
+        eff_basic       = block_sets_type ? fb->auth_basic : h->auth_basic;
+        eff_unsupported = block_sets_type ? fb->auth_type_unsupported
+                                          : h->auth_type_unsupported;
+        has_req = fb->auth_valid_user || fb->nauth_users
+                  || fb->nrequire_groups;
+
+        /* only engage auth when the block adds an auth requirement or sets its
+         * own AuthType; the top-level auth is checked separately */
+        if (!has_req && !block_sets_type) continue;
+
         {
         hta_parsed_t *tmp;
         ngx_uint_t    j;
@@ -655,11 +764,14 @@ hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h)
 
         tmp = ngx_pcalloc(r->pool, sizeof(hta_parsed_t));
         if (tmp == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        tmp->auth_basic = fb->auth_basic;
+        tmp->auth_basic = eff_basic;
+        tmp->auth_type_unsupported = eff_unsupported;
         tmp->auth_valid_user = fb->auth_valid_user;
-        tmp->auth_name = fb->auth_name;
-        tmp->auth_user_file = fb->auth_user_file;
-        tmp->auth_group_file = fb->auth_group_file;
+        tmp->auth_name = fb->auth_name.len ? fb->auth_name : h->auth_name;
+        tmp->auth_user_file = fb->auth_user_file.len ? fb->auth_user_file
+                                                     : h->auth_user_file;
+        tmp->auth_group_file = fb->auth_group_file.len ? fb->auth_group_file
+                                                       : h->auth_group_file;
         tmp->nauth_users = fb->nauth_users;
         for (j = 0; j < fb->nauth_users && j < HTA_MAX_USERS; j++)
             tmp->auth_users[j] = fb->auth_users[j];
@@ -685,7 +797,15 @@ hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h)
 static ngx_int_t
 hta_limit_matches(ngx_http_request_t *r, hta_limit_block_t *lb)
 {
-    ngx_uint_t hit = (r->method & lb->methods) != 0;
+    ngx_uint_t methods = lb->methods;
+    ngx_uint_t hit;
+
+    /* Apache: constraining GET also constrains HEAD. Fold HEAD into the mask so
+     * a "<Limit GET>" IP/auth gate cannot be bypassed with a HEAD request, and
+     * "<LimitExcept GET>" does not wrongly block HEAD health checks. */
+    if (methods & NGX_HTTP_GET) methods |= NGX_HTTP_HEAD;
+
+    hit = (r->method & methods) != 0;
     return lb->is_except ? !hit : hit;
 }
 
@@ -697,46 +817,25 @@ hta_limit_matches(ngx_http_request_t *r, hta_limit_block_t *lb)
 ngx_int_t
 hta_check_limit_access(ngx_http_request_t *r, hta_parsed_t *h)
 {
-    ngx_uint_t i, j;
-    ngx_int_t  allowed;
-    ngx_str_t  cip;
+    ngx_uint_t i;
 
     if (h->nlimit_blocks == 0) return NGX_OK;
 
-    cip = r->connection->addr_text;
-
     for (i = 0; i < h->nlimit_blocks; i++) {
         hta_limit_block_t *lb = &h->limit_blocks[i];
+        ngx_int_t          rc;
 
         if (!hta_limit_matches(r, lb)) continue;
 
-        if (lb->require_denied) return NGX_HTTP_FORBIDDEN;
-        if (lb->require_granted) continue;
+        if (!lb->has_acl && !lb->has_require_host && !lb->require_local
+            && !lb->require_denied && !lb->require_granted
+            && !lb->require_failed)
+            continue;
 
-        if (lb->has_acl) {
-            if (lb->access_order == HTA_ORDER_DENY_ALLOW) {
-                allowed = 1;
-                for (j = 0; j < lb->nacl; j++)
-                    if (!lb->acl[j].is_allow
-                        && hta_match_ip(&cip, &lb->acl[j].value))
-                        allowed = 0;
-                for (j = 0; j < lb->nacl; j++)
-                    if (lb->acl[j].is_allow
-                        && hta_match_ip(&cip, &lb->acl[j].value))
-                        allowed = 1;
-            } else {
-                allowed = 0;
-                for (j = 0; j < lb->nacl; j++)
-                    if (lb->acl[j].is_allow
-                        && hta_match_ip(&cip, &lb->acl[j].value))
-                        allowed = 1;
-                for (j = 0; j < lb->nacl; j++)
-                    if (!lb->acl[j].is_allow
-                        && hta_match_ip(&cip, &lb->acl[j].value))
-                        allowed = 0;
-            }
-            if (!allowed) return NGX_HTTP_FORBIDDEN;
-        }
+        rc = hta_eval_acl(r, lb->acl, lb->nacl, lb->access_order,
+            lb->has_acl, lb->has_require_host, lb->require_local,
+            lb->require_failed, lb->require_granted, lb->require_denied);
+        if (rc != NGX_OK) return rc;
     }
     return NGX_OK;
 }
@@ -758,18 +857,31 @@ hta_check_limit_auth(ngx_http_request_t *r, hta_parsed_t *h)
         hta_parsed_t      *tmp;
         ngx_uint_t         j;
         ngx_int_t          rc;
+        unsigned           block_sets_type, eff_basic, eff_unsupported, has_req;
 
         if (!hta_limit_matches(r, lb)) continue;
-        if (!lb->auth_basic) continue;
 
-        /* delegate to the standard auth path via a temporary hta_parsed_t */
+        /* inherit AuthType/AuthUserFile from the enclosing scope, same as
+         * <Files> - a per-method "Require valid-user" must not be dropped */
+        block_sets_type = lb->auth_basic || lb->auth_type_unsupported;
+        eff_basic       = block_sets_type ? lb->auth_basic : h->auth_basic;
+        eff_unsupported = block_sets_type ? lb->auth_type_unsupported
+                                          : h->auth_type_unsupported;
+        has_req = lb->auth_valid_user || lb->nauth_users
+                  || lb->nrequire_groups;
+
+        if (!has_req && !block_sets_type) continue;
+
         tmp = ngx_pcalloc(r->pool, sizeof(hta_parsed_t));
         if (tmp == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        tmp->auth_basic = lb->auth_basic;
+        tmp->auth_basic = eff_basic;
+        tmp->auth_type_unsupported = eff_unsupported;
         tmp->auth_valid_user = lb->auth_valid_user;
-        tmp->auth_name = lb->auth_name;
-        tmp->auth_user_file = lb->auth_user_file;
-        tmp->auth_group_file = lb->auth_group_file;
+        tmp->auth_name = lb->auth_name.len ? lb->auth_name : h->auth_name;
+        tmp->auth_user_file = lb->auth_user_file.len ? lb->auth_user_file
+                                                     : h->auth_user_file;
+        tmp->auth_group_file = lb->auth_group_file.len ? lb->auth_group_file
+                                                       : h->auth_group_file;
         tmp->nauth_users = lb->nauth_users;
         for (j = 0; j < lb->nauth_users && j < HTA_MAX_USERS; j++)
             tmp->auth_users[j] = lb->auth_users[j];
@@ -784,6 +896,67 @@ hta_check_limit_auth(ngx_http_request_t *r, hta_parsed_t *h)
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Script-execution kill-switch (SetHandler none / RemoveHandler .php /
+ * php_flag engine off). nginx routes *.php to FPM in a separate location, so we
+ * cannot un-route it; instead we deny the request in the access phase, which
+ * prevents an uploaded shell from executing. NOTE: this only fires if the
+ * htaccess module is enabled in the location that actually serves the scripts
+ * (e.g. `location ~ \.php$`), since that is where the request lands.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_name_is_script(ngx_str_t *bn)
+{
+    static const char *exts[] = {
+        ".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8",
+        ".phps", ".pht", ".phar", NULL
+    };
+    ngx_uint_t i;
+
+    for (i = 0; exts[i]; i++) {
+        size_t el = ngx_strlen(exts[i]);
+        if (bn->len >= el
+            && ngx_strncasecmp(bn->data + bn->len - el,
+                               (u_char *) exts[i], el) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+ngx_int_t
+hta_check_exec(ngx_http_request_t *r, hta_parsed_t *h)
+{
+    ngx_str_t  bn;
+    ngx_uint_t i;
+
+    if (!h->exec_disabled && h->nfiles_blocks == 0) return NGX_OK;
+
+    bn = hta_uri_basename(&r->uri);
+    if (bn.len == 0) return NGX_OK;
+
+    /* per-block: a matching <Files>/<FilesMatch> with the handler removed
+     * blocks execution regardless of extension (the block targets those files) */
+    for (i = 0; i < h->nfiles_blocks; i++) {
+        hta_files_block_t *fb = &h->files_blocks[i];
+        if (fb->exec_disabled && hta_files_match(fb, &bn)) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "htaccess: script execution disabled for \"%V\"", &r->uri);
+            return NGX_HTTP_FORBIDDEN;
+        }
+    }
+
+    /* directory-wide engine off: block known script extensions */
+    if (h->exec_disabled && hta_name_is_script(&bn)) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "htaccess: script execution disabled for \"%V\"", &r->uri);
+        return NGX_HTTP_FORBIDDEN;
+    }
+
+    return NGX_OK;
+}
+
+
 ngx_int_t
 hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
 {
@@ -792,7 +965,29 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
     ngx_str_t  user, pass;
     ngx_int_t  result;
 
-    if (!h->auth_basic) return NGX_OK;
+    /* AuthType set to an unsupported scheme (Digest, etc.): fail closed rather
+     * than silently serving the protected resource (Apache returns 500). */
+    if (h->auth_type_unsupported) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "htaccess: unsupported AuthType (only Basic is implemented), "
+            "denying access");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (!h->auth_basic) {
+        /* A Require user/group/valid-user with no usable AuthType is a
+         * misconfiguration; Apache fails closed with 500. Do the same instead
+         * of granting access (the old behavior was a silent auth bypass). */
+        if (h->auth_valid_user || h->nauth_users > 0
+            || h->nrequire_groups > 0)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "htaccess: Require user/group/valid-user without "
+                "\"AuthType Basic\", denying access");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        return NGX_OK;
+    }
 
     if (r->headers_in.authorization == NULL) {
         ngx_table_elt_t *www = ngx_list_push(&r->headers_out.headers);

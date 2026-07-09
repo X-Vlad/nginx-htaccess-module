@@ -25,6 +25,21 @@ hta_strip_crlf(u_char *s, size_t *len)
 }
 
 
+/* Case-insensitive test: does a token contain the substring "php"? Used to
+ * recognize RemoveHandler/AddType tokens that concern PHP execution. */
+static ngx_int_t
+hta_token_has_php(u_char *s)
+{
+    for (; *s; s++) {
+        if ((s[0] == 'p' || s[0] == 'P')
+            && (s[1] == 'h' || s[1] == 'H')
+            && (s[2] == 'p' || s[2] == 'P'))
+            return 1;
+    }
+    return 0;
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Tokenizer - split line into args, respecting quotes
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -94,7 +109,11 @@ hta_parse_flags(u_char *str, ngx_int_t *rcode, ngx_int_t *skip,
         else if (ngx_strncasecmp(s, (u_char *)"R=", 2) == 0) {
             f |= HTA_F_REDIRECT;
             *rcode = ngx_atoi(s + 2, ngx_strlen(s + 2));
-            if (*rcode < 300 || *rcode > 399) *rcode = 302;
+            /* Apache allows any status with R=. 3xx are redirects; 4xx/5xx make
+             * the rule respond with that error status (e.g. the common
+             * "- [R=404]" file-hiding idiom). Only a truly invalid code falls
+             * back to 302. */
+            if (*rcode < 100 || *rcode > 599) *rcode = 302;
         }
         else if (ngx_strcasecmp(s, (u_char *)"F") == 0)    f |= HTA_F_FORBIDDEN;
         else if (ngx_strcasecmp(s, (u_char *)"G") == 0)    f |= HTA_F_GONE;
@@ -113,6 +132,38 @@ hta_parse_flags(u_char *str, ngx_int_t *rcode, ngx_int_t *skip,
             u_char *colon = (u_char *)ngx_strchr(s + 2, ':');
             if (colon) {
                 ekey->data = s + 2; ekey->len = colon - (s + 2);
+                eval->data = colon + 1; eval->len = ngx_strlen(colon + 1);
+            }
+        }
+        /* Apache long-form flag names. Critically, "[forbidden]" must set F -
+         * MediaWiki's images/.htaccess uses "RewriteRule . - [forbidden]" to
+         * block script execution; matching only the short "F" left it a no-op
+         * (served the file = fail-open). */
+        else if (ngx_strcasecmp(s, (u_char *)"last") == 0)       f |= HTA_F_LAST;
+        else if (ngx_strcasecmp(s, (u_char *)"end") == 0)        f |= HTA_F_END;
+        else if (ngx_strcasecmp(s, (u_char *)"forbidden") == 0)  f |= HTA_F_FORBIDDEN;
+        else if (ngx_strcasecmp(s, (u_char *)"gone") == 0)       f |= HTA_F_GONE;
+        else if (ngx_strcasecmp(s, (u_char *)"nocase") == 0)     f |= HTA_F_NOCASE;
+        else if (ngx_strcasecmp(s, (u_char *)"noescape") == 0)   f |= HTA_F_NOESCAPE;
+        else if (ngx_strcasecmp(s, (u_char *)"qsappend") == 0)   f |= HTA_F_QSA;
+        else if (ngx_strcasecmp(s, (u_char *)"qsdiscard") == 0)  f |= HTA_F_QSD;
+        else if (ngx_strcasecmp(s, (u_char *)"passthrough") == 0) f |= HTA_F_PT;
+        else if (ngx_strcasecmp(s, (u_char *)"chain") == 0)      f |= HTA_F_CHAIN;
+        else if (ngx_strcasecmp(s, (u_char *)"redirect") == 0)   { f |= HTA_F_REDIRECT; *rcode = 302; }
+        else if (ngx_strncasecmp(s, (u_char *)"redirect=", 9) == 0) {
+            f |= HTA_F_REDIRECT;
+            *rcode = ngx_atoi(s + 9, ngx_strlen(s + 9));
+            if (*rcode < 100 || *rcode > 599) *rcode = 302;
+        }
+        else if (ngx_strncasecmp(s, (u_char *)"skip=", 5) == 0) {
+            f |= HTA_F_SKIP;
+            *skip = ngx_atoi(s + 5, ngx_strlen(s + 5));
+        }
+        else if (ngx_strncasecmp(s, (u_char *)"env=", 4) == 0) {
+            f |= HTA_F_ENV;
+            u_char *colon = (u_char *)ngx_strchr(s + 4, ':');
+            if (colon) {
+                ekey->data = s + 4; ekey->len = colon - (s + 4);
                 eval->data = colon + 1; eval->len = ngx_strlen(colon + 1);
             }
         }
@@ -163,6 +214,49 @@ hta_parse_cond(hta_parsed_t *h, u_char **args, ngx_uint_t n, ngx_log_t *log)
     else if (ngx_strcmp(pat, "-l") == 0) c->test_type = HTA_TEST_LINK;
     else if (ngx_strcmp(pat, "-e") == 0) c->test_type = HTA_TEST_EXISTS;
     else if (ngx_strcmp(pat, "-s") == 0) c->test_type = HTA_TEST_SIZE;
+    /* lexicographic / integer comparison operators. The operand (right-hand
+     * side) is stored in cond_pattern; no regex is compiled. This makes the
+     * ubiquitous force-HTTPS idiom "RewriteCond %{HTTPS} !=on" work instead of
+     * being misparsed as a never-matching regex. */
+    else if (pat[0] == '<' && pat[1] == '=') {
+        c->test_type = HTA_TEST_STR_LE;
+        c->cond_pattern.data = pat + 2; c->cond_pattern.len = ngx_strlen(pat+2);
+    }
+    else if (pat[0] == '>' && pat[1] == '=') {
+        c->test_type = HTA_TEST_STR_GE;
+        c->cond_pattern.data = pat + 2; c->cond_pattern.len = ngx_strlen(pat+2);
+    }
+    else if (pat[0] == '=') {
+        c->test_type = HTA_TEST_STR_EQ;
+        c->cond_pattern.data = pat + 1; c->cond_pattern.len = ngx_strlen(pat+1);
+    }
+    else if (pat[0] == '<') {
+        c->test_type = HTA_TEST_STR_LT;
+        c->cond_pattern.data = pat + 1; c->cond_pattern.len = ngx_strlen(pat+1);
+    }
+    else if (pat[0] == '>') {
+        c->test_type = HTA_TEST_STR_GT;
+        c->cond_pattern.data = pat + 1; c->cond_pattern.len = ngx_strlen(pat+1);
+    }
+    else if (pat[0] == '-' && (ngx_strncmp(pat+1, "eq", 2) == 0
+             || ngx_strncmp(pat+1, "ne", 2) == 0
+             || ngx_strncmp(pat+1, "lt", 2) == 0
+             || ngx_strncmp(pat+1, "le", 2) == 0
+             || ngx_strncmp(pat+1, "gt", 2) == 0
+             || ngx_strncmp(pat+1, "ge", 2) == 0)) {
+        if      (ngx_strncmp(pat+1,"eq",2)==0) c->test_type = HTA_TEST_INT_EQ;
+        else if (ngx_strncmp(pat+1,"ne",2)==0) c->test_type = HTA_TEST_INT_NE;
+        else if (ngx_strncmp(pat+1,"lt",2)==0) c->test_type = HTA_TEST_INT_LT;
+        else if (ngx_strncmp(pat+1,"le",2)==0) c->test_type = HTA_TEST_INT_LE;
+        else if (ngx_strncmp(pat+1,"gt",2)==0) c->test_type = HTA_TEST_INT_GT;
+        else                                   c->test_type = HTA_TEST_INT_GE;
+        /* operand follows the 3-char operator, optionally after a space */
+        {
+            u_char *op = pat + 3;
+            while (*op == ' ') op++;
+            c->cond_pattern.data = op; c->cond_pattern.len = ngx_strlen(op);
+        }
+    }
     else {
         c->test_type = HTA_TEST_REGEX;
         c->cond_pattern.data = pat;
@@ -401,13 +495,36 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
         } else if (ngx_strcasecmp(args[1], (u_char *)"ip") == 0 ||
                    ngx_strcasecmp(args[1], (u_char *)"host") == 0) {
             ngx_uint_t i;
-            fb->has_acl = 1;
+            fb->has_require_host = 1;
             for (i = 2; i < n && fb->nacl < HTA_MAX_FB_ACL; i++) {
                 fb->acl[fb->nacl].value.data = args[i];
                 fb->acl[fb->nacl].value.len = ngx_strlen(args[i]);
                 fb->acl[fb->nacl].is_allow = 1;
+                fb->acl[fb->nacl].is_require = 1;
                 fb->nacl++;
             }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"env") == 0) {
+            ngx_uint_t i;
+            fb->has_require_host = 1;
+            for (i = 2; i < n && fb->nacl < HTA_MAX_FB_ACL; i++) {
+                size_t  al = ngx_strlen(args[i]);
+                u_char *v  = ngx_pnalloc(pool, 4 + al);
+                if (v == NULL) continue;
+                ngx_memcpy(v, "env=", 4);
+                ngx_memcpy(v + 4, args[i], al);
+                fb->acl[fb->nacl].value.data = v;
+                fb->acl[fb->nacl].value.len  = 4 + al;
+                fb->acl[fb->nacl].is_allow   = 1;
+                fb->acl[fb->nacl].is_require = 1;
+                fb->nacl++;
+            }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"local") == 0) {
+            fb->require_local = 1;
+        } else {
+            fb->require_failed = 1;
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                "htaccess: unsupported \"Require %s\" in <Files>, "
+                "denying block", args[1]);
         }
         return;
     }
@@ -451,7 +568,13 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
 
     /* AuthType */
     if (ngx_strcasecmp(args[0], (u_char *)"AuthType") == 0 && n >= 2) {
-        fb->auth_basic = (ngx_strcasecmp(args[1], (u_char *)"Basic") == 0);
+        if (ngx_strcasecmp(args[1], (u_char *)"Basic") == 0) {
+            fb->auth_basic = 1;
+            fb->auth_type_unsupported = 0;
+        } else {
+            fb->auth_basic = 0;
+            fb->auth_type_unsupported = 1;
+        }
         return;
     }
     /* AuthName */
@@ -492,6 +615,33 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
         }
         return;
     }
+
+    /* SetHandler none / RemoveHandler .php - upload-dir kill-switch scoped to
+     * files matching this block (blocks script execution, see hta_check_exec) */
+    if (ngx_strcasecmp(args[0], (u_char *)"SetHandler") == 0) {
+        if (n >= 2
+            && (ngx_strcasecmp(args[1], (u_char *)"none") == 0
+                || ngx_strcasecmp(args[1], (u_char *)"default-handler") == 0))
+        {
+            fb->exec_disabled = 1;
+        }
+        return;
+    }
+    if (ngx_strcasecmp(args[0], (u_char *)"RemoveHandler") == 0) {
+        ngx_uint_t i;
+        for (i = 1; i < n; i++)
+            if (hta_token_has_php(args[i])) { fb->exec_disabled = 1; break; }
+        return;
+    }
+    if (ngx_strncasecmp(args[0], (u_char *)"php_", 4) == 0 && n >= 3
+        && ngx_strcasecmp(args[1], (u_char *)"engine") == 0
+        && (ngx_strcasecmp(args[2], (u_char *)"off") == 0
+            || ngx_strcasecmp(args[2], (u_char *)"0") == 0
+            || ngx_strcasecmp(args[2], (u_char *)"false") == 0))
+    {
+        fb->exec_disabled = 1;
+        return;
+    }
 }
 
 
@@ -502,12 +652,10 @@ hta_parse_line_fb(hta_files_block_t *fb, u_char *line, ngx_uint_t len,
 
 static void
 hta_parse_line_lb(hta_limit_block_t *lb, u_char *line, ngx_uint_t len,
-    ngx_log_t *log)
+    ngx_pool_t *lb_pool, ngx_log_t *log)
 {
     u_char     *args[16];
     ngx_uint_t  n;
-
-    (void) log;
 
     while (len > 0 && (line[0] == ' ' || line[0] == '\t')) { line++; len--; }
     while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t' ||
@@ -575,20 +723,49 @@ hta_parse_line_lb(hta_limit_block_t *lb, u_char *line, ngx_uint_t len,
         } else if (ngx_strcasecmp(args[1], (u_char *)"ip") == 0 ||
                    ngx_strcasecmp(args[1], (u_char *)"host") == 0) {
             ngx_uint_t i;
-            lb->has_acl = 1;
+            lb->has_require_host = 1;
             for (i = 2; i < n && lb->nacl < HTA_MAX_LB_ACL; i++) {
                 lb->acl[lb->nacl].value.data = args[i];
                 lb->acl[lb->nacl].value.len = ngx_strlen(args[i]);
                 lb->acl[lb->nacl].is_allow = 1;
+                lb->acl[lb->nacl].is_require = 1;
                 lb->nacl++;
             }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"env") == 0) {
+            ngx_uint_t i;
+            lb->has_require_host = 1;
+            for (i = 2; i < n && lb->nacl < HTA_MAX_LB_ACL; i++) {
+                size_t  al = ngx_strlen(args[i]);
+                u_char *v  = ngx_pnalloc(lb_pool, 4 + al);
+                if (v == NULL) continue;
+                ngx_memcpy(v, "env=", 4);
+                ngx_memcpy(v + 4, args[i], al);
+                lb->acl[lb->nacl].value.data = v;
+                lb->acl[lb->nacl].value.len  = 4 + al;
+                lb->acl[lb->nacl].is_allow   = 1;
+                lb->acl[lb->nacl].is_require = 1;
+                lb->nacl++;
+            }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"local") == 0) {
+            lb->require_local = 1;
+        } else {
+            lb->require_failed = 1;
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                "htaccess: unsupported \"Require %s\" in <Limit>, "
+                "denying block", args[1]);
         }
         return;
     }
 
     /* AuthType / AuthName / AuthUserFile / AuthGroupFile */
     if (ngx_strcasecmp(args[0], (u_char *)"AuthType") == 0 && n >= 2) {
-        lb->auth_basic = (ngx_strcasecmp(args[1], (u_char *)"Basic") == 0);
+        if (ngx_strcasecmp(args[1], (u_char *)"Basic") == 0) {
+            lb->auth_basic = 1;
+            lb->auth_type_unsupported = 0;
+        } else {
+            lb->auth_basic = 0;
+            lb->auth_type_unsupported = 1;
+        }
         return;
     }
     if (ngx_strcasecmp(args[0], (u_char *)"AuthName") == 0 && n >= 2) {
@@ -798,13 +975,21 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
         return;
     }
 
-    /* ---- Require ---- */
+    /* ---- Require ----
+     *
+     * Inside a <RequireNone> block the sense is inverted: access is DENIED to
+     * anything the inner Require matches. We map "Require ip/host/env" to a
+     * Deny ACL entry (and "Require all granted" to Deny-all) so a ban list
+     * like "<RequireNone> Require ip 1.2.3.4 </RequireNone>" actually blocks
+     * that client instead of flattening into an allow (which was fail-open).
+     */
     if (ngx_strcasecmp(args[0], (u_char *)"Require") == 0 && n >= 2) {
+        unsigned none = h->in_require_none;
         if (ngx_strcasecmp(args[1], (u_char *)"all") == 0 && n >= 3) {
             if (ngx_strcasecmp(args[2], (u_char *)"granted") == 0)
-                h->require_granted = 1;
+                { if (none) h->require_denied = 1; else h->require_granted = 1; }
             else if (ngx_strcasecmp(args[2], (u_char *)"denied") == 0)
-                h->require_denied = 1;
+                { if (!none) h->require_denied = 1; }
         } else if (ngx_strcasecmp(args[1], (u_char *)"valid-user") == 0) {
             h->auth_valid_user = 1;
         } else if (ngx_strcasecmp(args[1], (u_char *)"user") == 0) {
@@ -824,13 +1009,38 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
         } else if (ngx_strcasecmp(args[1], (u_char *)"ip") == 0 ||
                    ngx_strcasecmp(args[1], (u_char *)"host") == 0) {
             ngx_uint_t i;
-            h->has_acl = 1;
+            if (none) h->has_acl = 1; else h->has_require_host = 1;
             for (i = 2; i < n && h->nacl < HTA_MAX_USERS; i++) {
                 h->acl[h->nacl].value.data = args[i];
                 h->acl[h->nacl].value.len = ngx_strlen(args[i]);
-                h->acl[h->nacl].is_allow = 1;
+                h->acl[h->nacl].is_allow = none ? 0 : 1;
+                h->acl[h->nacl].is_require = none ? 0 : 1;
                 h->nacl++;
             }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"env") == 0) {
+            ngx_uint_t i;
+            if (none) h->has_acl = 1; else h->has_require_host = 1;
+            for (i = 2; i < n && h->nacl < HTA_MAX_USERS; i++) {
+                size_t  al = ngx_strlen(args[i]);
+                u_char *v  = ngx_pnalloc(h->pool, 4 + al);
+                if (v == NULL) continue;
+                ngx_memcpy(v, "env=", 4);
+                ngx_memcpy(v + 4, args[i], al);
+                h->acl[h->nacl].value.data = v;
+                h->acl[h->nacl].value.len  = 4 + al;
+                h->acl[h->nacl].is_allow   = none ? 0 : 1;
+                h->acl[h->nacl].is_require = none ? 0 : 1;
+                h->nacl++;
+            }
+        } else if (ngx_strcasecmp(args[1], (u_char *)"local") == 0) {
+            h->require_local = 1;
+        } else {
+            /* Unsupported Require provider (expr, method, not, forward-dns,
+             * ...). Fail closed rather than silently granting access. */
+            h->require_failed = 1;
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                "htaccess: unsupported \"Require %s\", denying scope",
+                args[1]);
         }
         return;
     }
@@ -883,6 +1093,21 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
                 hd->value.len = ngx_strlen(args[off + 2]);
                 hta_strip_crlf(hd->value.data, &hd->value.len);
             }
+
+            /* optional trailing "env=[!]VAR" condition (e.g. conditional CORS
+             * "Header set Access-Control-Allow-Origin * env=CORS_OK") */
+            if (n > off + 1
+                && ngx_strncmp(args[n-1], (u_char *)"env=", 4) == 0)
+            {
+                u_char *e = args[n-1] + 4;
+                if (*e == '!') { hd->cond_negate = 1; e++; }
+                hd->cond_env.data = e;
+                hd->cond_env.len  = ngx_strlen(e);
+                /* env= was misread as the value (set with no real value) */
+                if (hd->value.data == args[n-1]) {
+                    hd->value.data = NULL; hd->value.len = 0;
+                }
+            }
             h->nheaders++;
         }
         return;
@@ -932,7 +1157,15 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
 
     /* ---- AuthType ---- */
     if (ngx_strcasecmp(args[0], (u_char *)"AuthType") == 0 && n >= 2) {
-        h->auth_basic = (ngx_strcasecmp(args[1], (u_char *)"Basic") == 0);
+        if (ngx_strcasecmp(args[1], (u_char *)"Basic") == 0) {
+            h->auth_basic = 1;
+            h->auth_type_unsupported = 0;
+        } else {
+            /* Digest or any other scheme is not implemented; mark it so the
+             * auth check fails closed instead of silently disabling auth. */
+            h->auth_basic = 0;
+            h->auth_type_unsupported = 1;
+        }
         return;
     }
 
@@ -958,6 +1191,21 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
     /* ---- DefaultType ---- */
     if (ngx_strcasecmp(args[0], (u_char *)"DefaultType") == 0 && n >= 2) {
         h->default_type.data = args[1]; h->default_type.len = ngx_strlen(args[1]);
+        return;
+    }
+
+    /* ---- FallbackResource ----
+     * Front-controller fallback: when the request maps to no existing file,
+     * serve this resource instead (mod_dir). "disabled" clears an inherited
+     * setting. */
+    if (ngx_strcasecmp(args[0], (u_char *)"FallbackResource") == 0 && n >= 2) {
+        if (ngx_strcasecmp(args[1], (u_char *)"disabled") == 0) {
+            h->fallback_resource.data = NULL;
+            h->fallback_resource.len  = 0;
+        } else {
+            h->fallback_resource.data = args[1];
+            h->fallback_resource.len  = ngx_strlen(args[1]);
+        }
         return;
     }
 
@@ -1266,6 +1514,17 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
             is_known = 1;
         }
 
+        /* "php_flag engine off" (or php_admin_flag/php_value) is the classic
+         * upload-dir kill-switch. FPM has no "engine" ini so exposing it via
+         * PHP_VALUE is a no-op; enforce it directly by blocking execution. */
+        if (is_known && ngx_strcasecmp(args[1], (u_char *)"engine") == 0
+            && (ngx_strcasecmp(args[2], (u_char *)"off") == 0
+                || ngx_strcasecmp(args[2], (u_char *)"0") == 0
+                || ngx_strcasecmp(args[2], (u_char *)"false") == 0))
+        {
+            h->exec_disabled = 1;
+        }
+
         if (is_known && h->nphp_values < HTA_MAX_PHP_VALUES) {
             hta_php_value_t *pv = &h->php_values[h->nphp_values];
             pv->name.data  = args[1];
@@ -1304,8 +1563,19 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
 
     /* Satisfy is handled above (see "Satisfy Any/All") */
 
-    /* ---- SetHandler - ignore ---- */
-    if (ngx_strcasecmp(args[0], (u_char *)"SetHandler") == 0) return;
+    /* ---- SetHandler ----
+     * "SetHandler none" / "default-handler" is the upload-dir kill-switch that
+     * turns off script execution; honor it by blocking execution of scripts in
+     * this scope (see hta_check_exec). Any other value is ignored. */
+    if (ngx_strcasecmp(args[0], (u_char *)"SetHandler") == 0) {
+        if (n >= 2
+            && (ngx_strcasecmp(args[1], (u_char *)"none") == 0
+                || ngx_strcasecmp(args[1], (u_char *)"default-handler") == 0))
+        {
+            h->exec_disabled = 1;
+        }
+        return;
+    }
 
     /* ---- AddDefaultCharset ---- */
     if (ngx_strcasecmp(args[0], (u_char *)"AddDefaultCharset") == 0 && n >= 2) {
@@ -1327,7 +1597,13 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
     if (ngx_strcasecmp(args[0], (u_char *)"SetInputFilter") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"SetOutputFilter") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"AddOutputFilterByType") == 0) return;
-    if (ngx_strcasecmp(args[0], (u_char *)"RemoveHandler") == 0) return;
+    /* RemoveHandler .php (upload-dir hardening) - block script execution */
+    if (ngx_strcasecmp(args[0], (u_char *)"RemoveHandler") == 0) {
+        ngx_uint_t i;
+        for (i = 1; i < n; i++)
+            if (hta_token_has_php(args[i])) { h->exec_disabled = 1; break; }
+        return;
+    }
     if (ngx_strcasecmp(args[0], (u_char *)"RemoveType") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"ServerSignature") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"FileETag") == 0) return;
@@ -1358,7 +1634,13 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
     if (ngx_strcasecmp(args[0], (u_char *)"SecRule") == 0) return;
     if (ngx_strcasecmp(args[0], (u_char *)"SecAction") == 0) return;
 
-    /* Unknown directives silently ignored */
+    /* Unrecognized directive. Record it and warn so it is not silently lost;
+     * with `htaccess_strict on;` the access handler turns this into a 500
+     * (fail closed, matching Apache) instead of ignoring a possibly
+     * security-relevant directive. */
+    h->has_unknown = 1;
+    ngx_log_error(NGX_LOG_WARN, log, 0,
+        "htaccess: unknown directive \"%s\" ignored", args[0]);
 }
 
 
@@ -1436,6 +1718,7 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
     ngx_int_t          files_depth;
     hta_limit_block_t *cur_lb;
     ngx_int_t          limit_depth;
+    ngx_int_t          require_none_depth;
 
     fd = ngx_open_file(filepath, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
     if (fd == NGX_INVALID_FILE) return NULL;
@@ -1466,6 +1749,7 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
     files_depth = 0;   /* nesting depth within Files block */
     cur_lb = NULL;     /* non-NULL = inside <Limit>/<LimitExcept> block */
     limit_depth = 0;
+    require_none_depth = 0;  /* >0 = inside <RequireNone> (invert to Deny) */
 
     p = buf;
     end = buf + nr;
@@ -1544,6 +1828,10 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
                                 } else {
                                     cur_lb = NULL;
                                 }
+                            } else if (require_none_depth > 0) {
+                                require_none_depth--;
+                                if (require_none_depth == 0)
+                                    h->in_require_none = 0;
                             }
                         } else if (tlen > 1 && trimmed[0] == '<'
                                    && trimmed[tlen-1] == '>') {
@@ -1603,11 +1891,18 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
                                     skip_depth = 1;
                                 }
                             } else if (ngx_strncasecmp(trimmed + 1,
-                                           (u_char *)"Files", 5) == 0
-                                       && h->nfiles_blocks
-                                              < HTA_MAX_FILES_BLOCKS)
+                                           (u_char *)"Files", 5) == 0)
                             {
-                                /* entering <Files> or <FilesMatch> block */
+                                /* entering <Files>/<FilesMatch>. If the per-file
+                                 * cap is reached, fail closed (skip the block)
+                                 * so its access/auth directives cannot leak into
+                                 * the global scope. */
+                                if (h->nfiles_blocks >= HTA_MAX_FILES_BLOCKS) {
+                                    ngx_log_error(NGX_LOG_WARN, log, 0,
+                                        "htaccess: too many <Files> blocks, "
+                                        "skipping");
+                                    skip_depth = 1;
+                                } else {
                                 hta_files_block_t *fb =
                                     &h->files_blocks[h->nfiles_blocks];
                                 u_char *ps;
@@ -1619,10 +1914,20 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
                                     (u_char *)"FilesMatch", 10) == 0);
 
                                 /* extract pattern from tag:
-                                 * <Files "pattern"> or <FilesMatch "regex">
+                                 * <Files "pattern">, <FilesMatch "regex"> or
+                                 * the tilde regex form <Files ~ "regex">
                                  */
                                 ps = trimmed + (fb->is_regex ? 12 : 7);
                                 while (*ps == ' ' || *ps == '\t') ps++;
+                                if (*ps == '~') {
+                                    /* <Files ~ "re"> is a regex match, like
+                                     * <FilesMatch>. Without this the "~ ..."
+                                     * was stored as a literal filename that
+                                     * never matched (Deny rules failed open). */
+                                    fb->is_regex = 1;
+                                    ps++;
+                                    while (*ps == ' ' || *ps == '\t') ps++;
+                                }
                                 if (*ps == '"' || *ps == '\'') ps++;
                                 pe = trimmed + tlen - 1; /* before > */
                                 while (pe > ps && (*(pe-1) == '"'
@@ -1651,6 +1956,13 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
 
                                 cur_fb = fb;
                                 h->nfiles_blocks++;
+                                }
+                            } else if (ngx_strncasecmp(trimmed + 1,
+                                           (u_char *)"RequireNone", 11) == 0) {
+                                /* enter <RequireNone>: inner Require ip/host/env
+                                 * are parsed inline but inverted to Deny */
+                                require_none_depth++;
+                                h->in_require_none = 1;
                             } else if (!hta_should_enter_block(
                                            trimmed, tlen)) {
                                 skip_depth = 1;
@@ -1661,7 +1973,8 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log)
                                 hta_parse_line_fb(cur_fb, wl, parse_len,
                                                   pool, log);
                             } else if (cur_lb) {
-                                hta_parse_line_lb(cur_lb, wl, parse_len, log);
+                                hta_parse_line_lb(cur_lb, wl, parse_len,
+                                                  pool, log);
                             } else {
                                 hta_parse_line(h, wl, parse_len, log);
                             }

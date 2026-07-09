@@ -36,6 +36,29 @@
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Mirror of ngx_http_index_module's per-location config so "Options -Indexes"
+ * enforcement can consult nginx's ACTUAL `index` directive list (including a
+ * custom `index home.html;`) instead of guessing filenames. This struct is not
+ * exported in a public header, but it has been ABI-stable for many releases and
+ * a dynamic module is always built against the exact nginx version it loads
+ * into, so the layout is guaranteed to match at build time.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    ngx_array_t *indices;       /* array of hta_index_elt_t */
+    size_t       max_index_len;
+} hta_index_loc_conf_t;
+
+typedef struct {
+    ngx_str_t    name;
+    ngx_array_t *lengths;       /* non-NULL when the index name is scripted */
+    ngx_array_t *values;
+} hta_index_elt_t;
+
+extern ngx_module_t ngx_http_index_module;
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Forward declarations
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -72,6 +95,22 @@ static ngx_command_t hta_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_hta_loc_conf_t, filename),
+      NULL },
+
+    /* fail closed (500) when a .htaccess uses an unrecognized directive */
+    { ngx_string("htaccess_strict"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_hta_loc_conf_t, strict),
+      NULL },
+
+    /* trust X-Forwarded-Proto for SSLRequireSSL (nginx behind a TLS proxy) */
+    { ngx_string("htaccess_trust_proxy"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_hta_loc_conf_t, trust_proxy),
       NULL },
 
     ngx_null_command
@@ -123,6 +162,8 @@ hta_create_loc(ngx_conf_t *cf)
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_hta_loc_conf_t));
     if (conf == NULL) return NULL;
     conf->enable = NGX_CONF_UNSET;
+    conf->strict = NGX_CONF_UNSET;
+    conf->trust_proxy = NGX_CONF_UNSET;
     return conf;
 }
 
@@ -133,6 +174,8 @@ hta_merge_loc(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_hta_loc_conf_t *conf = child;
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_str_value(conf->filename, prev->filename, ".htaccess");
+    ngx_conf_merge_value(conf->strict, prev->strict, 0);
+    ngx_conf_merge_value(conf->trust_proxy, prev->trust_proxy, 0);
     return NGX_CONF_OK;
 }
 
@@ -310,7 +353,24 @@ hta_collect_files(ngx_http_request_t *r, ngx_str_t *root, ngx_str_t *filename,
     dlen = root->len;
     ngx_memcpy(dir, root->data, dlen);
 
-    uri_p = r->uri.data;
+    /* For `alias` locations, the leading part of r->uri that matches the
+     * location prefix is replaced by `root` on disk (see
+     * ngx_http_map_uri_to_path). Skip those bytes so paths resolve under the
+     * alias target instead of doubling the prefix; otherwise every .htaccess
+     * under an aliased location was read from a bogus path and silently
+     * ignored (including its access/auth rules). */
+    {
+        ngx_http_core_loc_conf_t *clcf;
+        size_t                    alias_off = 0;
+
+        clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+        if (clcf->alias != 0 && clcf->alias != NGX_MAX_SIZE_T_VALUE
+            && clcf->alias <= r->uri.len)
+        {
+            alias_off = clcf->alias;
+        }
+        uri_p = r->uri.data + alias_off;
+    }
     uri_end = r->uri.data + r->uri.len;
     if (uri_p < uri_end && *uri_p == '/') uri_p++;
 
@@ -505,11 +565,17 @@ hta_rewrite_handler(ngx_http_request_t *r)
     files = hta_get_files(r, &clcf->root, &lcf->filename);
     if (files == NULL) return NGX_DECLINED;
 
+    {
+    ngx_str_t fallback = ngx_null_string;
+
     for (i = 0; i < files->count; i++) {
         hta_parsed_t *h;
 
         h = hta_get_parsed(r, mc, &files->files[i]);
         if (h == NULL) continue;
+
+        /* deepest FallbackResource wins (files walk root -> leaf) */
+        if (h->fallback_resource.len) fallback = h->fallback_resource;
 
         /* apply SetEnvIf early (before rewrite rules) */
         hta_apply_setenvif(r, h);
@@ -525,6 +591,14 @@ hta_rewrite_handler(ngx_http_request_t *r)
 
         rc = hta_apply_rules(r, h);
         if (rc != NGX_DECLINED) return rc;
+    }
+
+    /* FallbackResource: no rule matched and the file is absent -> front
+     * controller. Runs last so real files / explicit rewrites win. */
+    if (fallback.len) {
+        rc = hta_apply_fallback(r, &fallback);
+        if (rc != NGX_DECLINED) return rc;
+    }
     }
 
     return NGX_DECLINED;
@@ -605,20 +679,14 @@ hta_access_handler(ngx_http_request_t *r)
             && (p[1] == 'h' || p[1] == 'H')
             && (p[2] == 't' || p[2] == 'T'))
         {
-            ngx_uint_t blen = last - p;
-            if ((blen == 9
-                 && ngx_strncasecmp(p, (u_char *)".htaccess", 9) == 0)
-                || (blen == 9
-                    && ngx_strncasecmp(p, (u_char *)".htpasswd", 9) == 0)
-                || (blen == 8
-                    && ngx_strncasecmp(p, (u_char *)".htgroup", 8) == 0)
-                || (blen == 9
-                    && ngx_strncasecmp(p, (u_char *)".htdigest", 9) == 0))
-            {
-                ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                    "htaccess: blocked access to \"%V\"", &r->uri);
-                return NGX_HTTP_FORBIDDEN;
-            }
+            /* Block ANY file whose basename starts with ".ht" (Apache's stock
+             * "<FilesMatch ^\.ht>" convention). This covers not only
+             * .htaccess/.htpasswd/.htgroup/.htdigest but also editor backups
+             * like .htpasswd.bak, .htaccess~, .htaccess.save and swap files,
+             * which would otherwise be served in cleartext. */
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "htaccess: blocked access to \"%V\"", &r->uri);
+            return NGX_HTTP_FORBIDDEN;
         }
     }
 
@@ -637,7 +705,18 @@ hta_access_handler(ngx_http_request_t *r)
         if (h == NULL) continue;
         if (nparsed < HTA_MAX_DEPTH) parsed_list[nparsed++] = h;
 
-        rc = hta_check_ssl(r, h);
+        /* Strict mode: an unrecognized directive is a hard error (Apache 500s)
+         * rather than being silently dropped, which could otherwise turn a
+         * misspelled security directive into no protection. */
+        if (lcf->strict && h->has_unknown) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "htaccess: unknown directive in \"%V\" and htaccess_strict is "
+                "on, denying", &files->files[i]);
+            rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            goto check_errdoc;
+        }
+
+        rc = hta_check_ssl(r, h, lcf->trust_proxy);
         if (rc != NGX_OK) goto check_errdoc;
 
         /* Satisfy semantics:
@@ -646,10 +725,12 @@ hta_access_handler(ngx_http_request_t *r)
          *                  denied; that way we don't push a stale
          *                  WWW-Authenticate header onto a request that
          *                  already passed by IP. */
+        unsigned skip_auth = 0;
         if (h->satisfy == HTA_SATISFY_ANY) {
-            ngx_int_t rc_access = hta_check_access(r, h);
-            if (rc_access == NGX_OK) {
-                /* access OK, skip auth entirely */
+            if (hta_check_access(r, h) == NGX_OK) {
+                /* access granted by IP - "Any" is satisfied, so no auth is
+                 * required at this scope, including per-block Require */
+                skip_auth = 1;
             } else {
                 rc = hta_check_auth(r, h);
                 if (rc != NGX_OK) goto check_errdoc;
@@ -666,15 +747,121 @@ hta_access_handler(ngx_http_request_t *r)
         rc = hta_check_files_access(r, h);
         if (rc != NGX_OK) goto check_errdoc;
 
-        rc = hta_check_files_auth(r, h);
-        if (rc != NGX_OK) goto check_errdoc;
+        if (!skip_auth) {
+            rc = hta_check_files_auth(r, h);
+            if (rc != NGX_OK) goto check_errdoc;
+        }
 
         /* <Limit>/<LimitExcept> block access + auth */
         rc = hta_check_limit_access(r, h);
         if (rc != NGX_OK) goto check_errdoc;
 
-        rc = hta_check_limit_auth(r, h);
+        if (!skip_auth) {
+            rc = hta_check_limit_auth(r, h);
+            if (rc != NGX_OK) goto check_errdoc;
+        }
+
+        /* SetHandler none / RemoveHandler .php / php_flag engine off:
+         * block script execution (uploaded-shell protection) */
+        rc = hta_check_exec(r, h);
         if (rc != NGX_OK) goto check_errdoc;
+    }
+
+    /* Options -Indexes enforcement: refuse to list a directory that has no
+     * index file. Without this the parsed opts were never consulted, so a
+     * hardening "Options -Indexes" was a no-op and `autoindex on` would still
+     * expose listings. Only fires when Options explicitly disabled Indexes and
+     * the request is for a directory with no index file on disk. */
+    if (r->uri.len > 0 && r->uri.data[r->uri.len - 1] == '/') {
+        unsigned saw_opt = 0;
+        int      indexes = 1;
+
+        for (i = 0; i < nparsed; i++) {
+            hta_parsed_t *h2 = parsed_list[i];
+            if (!h2->has_opts) continue;
+            if (h2->opts_set & HTA_OPT_INDEXES)   { indexes = 1; saw_opt = 1; }
+            if (h2->opts_unset & HTA_OPT_INDEXES) { indexes = 0; saw_opt = 1; }
+        }
+
+        if (saw_opt && !indexes) {
+            ngx_str_t             dpath;
+            size_t                root_len;
+            u_char               *last;
+            ngx_file_info_t       fi;
+            unsigned              found_index = 0;
+            hta_index_loc_conf_t *ilcf;
+
+            last = ngx_http_map_uri_to_path(r, &dpath, &root_len, 256);
+            if (last != NULL) {
+                /* .htaccess DirectoryIndex names */
+                for (i = 0; i < nparsed && !found_index; i++) {
+                    hta_parsed_t *h2 = parsed_list[i];
+                    ngx_uint_t    k;
+                    for (k = 0; k < h2->nindex && !found_index; k++) {
+                        u_char *e;
+                        if (h2->index_files[k].len >= 255) continue;
+                        e = ngx_cpymem(last, h2->index_files[k].data,
+                                       h2->index_files[k].len);
+                        *e = '\0';
+                        if (ngx_file_info(dpath.data, &fi) == 0
+                            && ngx_is_file(&fi))
+                            found_index = 1;
+                    }
+                }
+
+                /* nginx's own `index` directive list (covers the default
+                 * index.html and any custom names). A scripted or absolute
+                 * index name is assumed servable so we never wrongly 403.
+                 *
+                 * This reinterprets ngx_http_index_module's private loc conf via
+                 * the mirrored struct. The layout is identical across the
+                 * supported nginx range; guard it by version so a future bump
+                 * forces re-verification instead of silently misreading memory.
+                 * Outside the range, fall back to the common default names. */
+#if (nginx_version >= 1024000 && nginx_version <= 1030999)
+                ilcf = ngx_http_get_module_loc_conf(r, ngx_http_index_module);
+                if (!found_index && ilcf != NULL && ilcf->indices != NULL) {
+                    hta_index_elt_t *idx = ilcf->indices->elts;
+                    ngx_uint_t       k;
+                    for (k = 0; k < ilcf->indices->nelts && !found_index; k++) {
+                        u_char *e;
+                        if (idx[k].lengths != NULL) { found_index = 1; break; }
+                        if (idx[k].name.len == 0 || idx[k].name.len >= 255)
+                            continue;
+                        if (idx[k].name.data[0] == '/') { found_index = 1; break; }
+                        e = ngx_cpymem(last, idx[k].name.data, idx[k].name.len);
+                        *e = '\0';
+                        if (ngx_file_info(dpath.data, &fi) == 0
+                            && ngx_is_file(&fi))
+                            found_index = 1;
+                    }
+                }
+#else
+                {
+                    static const char *defidx[] = {
+                        "index.html", "index.htm", "index.php", NULL };
+                    ngx_uint_t di;
+                    (void) ilcf;
+                    for (di = 0; defidx[di] && !found_index; di++) {
+                        u_char *e = ngx_cpymem(last, defidx[di],
+                                               ngx_strlen(defidx[di]));
+                        *e = '\0';
+                        if (ngx_file_info(dpath.data, &fi) == 0
+                            && ngx_is_file(&fi))
+                            found_index = 1;
+                    }
+                }
+#endif
+            }
+
+            if (!found_index) {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                    "htaccess: Options -Indexes, refusing listing of \"%V\"",
+                    &r->uri);
+                rc = NGX_HTTP_FORBIDDEN;
+                goto check_errdoc;
+            }
+        }
     }
 
     return NGX_DECLINED;
