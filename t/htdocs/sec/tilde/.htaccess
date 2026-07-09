@@ -1,0 +1,3 @@
+<Files ~ "\.secret$">
+Deny from all
+</Files>

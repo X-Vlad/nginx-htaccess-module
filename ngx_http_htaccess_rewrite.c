@@ -9,6 +9,11 @@
 #include <sys/stat.h>
 
 
+/* defined later in this file - used by %{HTTP:Header} expansion */
+static ngx_table_elt_t *hta_find_req_header(ngx_http_request_t *r,
+    ngx_str_t *name);
+
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Variable expansion - %{VAR_NAME}
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -34,21 +39,84 @@ hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst)
             vlen = p - vs;
             p++;  /* skip } */
 
-            if (vlen == 11 && ngx_strncasecmp(vs, (u_char *)"REQUEST_URI", 11) == 0) {
+            if (vlen > 5 && ngx_strncasecmp(vs, (u_char *)"HTTP:", 5) == 0) {
+                /* %{HTTP:Header-Name} - arbitrary request header */
+                ngx_str_t        hname;
+                ngx_table_elt_t *he;
+                hname.data = vs + 5;
+                hname.len  = vlen - 5;
+                he = hta_find_req_header(r, &hname);
+                if (he) val = he->value;
+            } else if (vlen > 4 && ngx_strncasecmp(vs, (u_char *)"ENV:", 4) == 0) {
+                /* %{ENV:name} - nginx variable set via SetEnv/SetEnvIf/[E=] */
+                ngx_str_t lname;
+                lname.len  = vlen - 4;
+                lname.data = ngx_pnalloc(r->pool, lname.len);
+                if (lname.data) {
+                    ngx_uint_t                 k, hash;
+                    ngx_http_variable_value_t *vv;
+                    for (k = 0; k < lname.len; k++)
+                        lname.data[k] = ngx_tolower(vs[4 + k]);
+                    hash = ngx_hash_key(lname.data, lname.len);
+                    vv = ngx_http_get_variable(r, &lname, hash);
+                    if (vv && !vv->not_found && vv->len > 0) {
+                        val.data = vv->data; val.len = vv->len;
+                    }
+                }
+            } else if (vlen >= 4 && ngx_strncasecmp(vs, (u_char *)"TIME", 4) == 0) {
+                /* %{TIME}, %{TIME_YEAR}, %{TIME_MON}, ... (local server time) */
+                struct tm  tmv;
+                u_char    *b = ngx_pnalloc(r->pool, 16);
+                ngx_libc_localtime(ngx_time(), &tmv);
+                if (b) {
+                    val.data = b;
+                    if (vlen == 4)
+                        val.len = ngx_sprintf(b, "%04d%02d%02d%02d%02d%02d",
+                            tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                            tmv.tm_hour, tmv.tm_min, tmv.tm_sec) - b;
+                    else if (vlen == 9 && ngx_strncasecmp(vs+5,(u_char*)"YEAR",4)==0)
+                        val.len = ngx_sprintf(b, "%04d", tmv.tm_year+1900) - b;
+                    else if (vlen == 8 && ngx_strncasecmp(vs+5,(u_char*)"MON",3)==0)
+                        val.len = ngx_sprintf(b, "%02d", tmv.tm_mon+1) - b;
+                    else if (vlen == 8 && ngx_strncasecmp(vs+5,(u_char*)"DAY",3)==0)
+                        val.len = ngx_sprintf(b, "%02d", tmv.tm_mday) - b;
+                    else if (vlen == 9 && ngx_strncasecmp(vs+5,(u_char*)"HOUR",4)==0)
+                        val.len = ngx_sprintf(b, "%02d", tmv.tm_hour) - b;
+                    else if (vlen == 8 && ngx_strncasecmp(vs+5,(u_char*)"MIN",3)==0)
+                        val.len = ngx_sprintf(b, "%02d", tmv.tm_min) - b;
+                    else if (vlen == 8 && ngx_strncasecmp(vs+5,(u_char*)"SEC",3)==0)
+                        val.len = ngx_sprintf(b, "%02d", tmv.tm_sec) - b;
+                    else if (vlen == 9 && ngx_strncasecmp(vs+5,(u_char*)"WDAY",4)==0)
+                        val.len = ngx_sprintf(b, "%d", tmv.tm_wday) - b;
+                    else
+                        val.data = NULL;  /* unknown TIME_* -> empty */
+                }
+            } else if (vlen == 11 && ngx_strncasecmp(vs, (u_char *)"REQUEST_URI", 11) == 0) {
                 val = r->uri;
             } else if (vlen == 16 && ngx_strncasecmp(vs, (u_char *)"REQUEST_FILENAME", 16) == 0) {
-                ngx_http_core_loc_conf_t *clcf;
-                u_char *tmp;
-                clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-                /* Security: reject URIs with ".." to prevent path traversal.
-                 * Use length-aware scan — r->uri is ngx_str_t, not NUL-terminated */
+                /* Filesystem path of the request. map_uri_to_path is alias-aware
+                 * (matches the alias-fixed .htaccess collection); the old
+                 * root+uri concat double-counted the location prefix under an
+                 * `alias`, so the "-f/-d -> index.php" guard always misfired.
+                 * Security: reject ".." first (map_uri_to_path does not). */
                 if (ngx_strnstr(r->uri.data, "..", r->uri.len) == NULL) {
-                    tmp = ngx_pnalloc(r->pool, clcf->root.len + r->uri.len + 1);
-                    if (tmp) {
-                        ngx_memcpy(tmp, clcf->root.data, clcf->root.len);
-                        ngx_memcpy(tmp + clcf->root.len, r->uri.data, r->uri.len);
-                        tmp[clcf->root.len + r->uri.len] = '\0';
-                        val.data = tmp; val.len = clcf->root.len + r->uri.len;
+                    ngx_str_t path;
+                    size_t    rl;
+                    u_char   *last = ngx_http_map_uri_to_path(r, &path, &rl, 0);
+                    if (last != NULL) {
+                        val.data = path.data;
+                        val.len  = last - path.data;
+                    }
+                }
+            } else if (vlen == 15 && ngx_strncasecmp(vs, (u_char *)"SCRIPT_FILENAME", 15) == 0) {
+                /* same on-disk path as REQUEST_FILENAME in this context */
+                if (ngx_strnstr(r->uri.data, "..", r->uri.len) == NULL) {
+                    ngx_str_t path;
+                    size_t    rl;
+                    u_char   *last = ngx_http_map_uri_to_path(r, &path, &rl, 0);
+                    if (last != NULL) {
+                        val.data = path.data;
+                        val.len  = last - path.data;
                     }
                 }
             } else if (vlen == 12 && ngx_strncasecmp(vs, (u_char *)"QUERY_STRING", 12) == 0) {
@@ -99,7 +167,13 @@ hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst)
             } else if (vlen == 11 && ngx_strncasecmp(vs, (u_char *)"REMOTE_HOST", 11) == 0) {
                 val = r->connection->addr_text;
             } else if (vlen == 14 && ngx_strncasecmp(vs, (u_char *)"REQUEST_SCHEME", 14) == 0) {
-                goto nginx_var_fallback;
+                /* nginx has no $request_scheme; derive it directly. */
+#if (NGX_HTTP_SSL)
+                if (r->connection->ssl) { ngx_str_set(&val, "https"); }
+                else                    { ngx_str_set(&val, "http"); }
+#else
+                ngx_str_set(&val, "http");
+#endif
             } else {
 nginx_var_fallback:
                 /* fallback: nginx variable lookup */
@@ -141,34 +215,63 @@ nginx_var_fallback:
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Substitution with backreferences ($1..$9) and variables (%{VAR})
+ * Backreference context for a rule being applied:
+ *   $0-$9  -> capture groups of the RewriteRule pattern (rule_subject)
+ *   %0-%9  -> capture groups of the last matching RewriteCond (cond_subject)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    ngx_str_t   rule_subject;
+    int        *rule_caps;
+    ngx_uint_t  rule_ncaps;
+    ngx_str_t   cond_subject;
+    int        *cond_caps;
+    ngx_uint_t  cond_ncaps;
+    unsigned    have_rule:1;
+    unsigned    have_cond:1;
+} hta_backref_t;
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Full expansion: %{VAR}, $N (rule backref), %N (cond backref)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static ngx_int_t
-hta_substitute(ngx_http_request_t *r, hta_rule_t *rule, ngx_str_t *uri,
-    int *caps, ngx_uint_t ncaps)
+hta_expand_full(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst,
+    hta_backref_t *br)
 {
-    u_char  res[HTA_MAX_PATH];
-    u_char *p, *end, *d;
+    u_char    *p = src->data, *end = src->data + src->len;
+    u_char     res[HTA_MAX_PATH];
+    u_char    *d = res;
     ngx_uint_t rlen = 0;
 
-    if (ngx_strcmp(rule->substitution.data, "-") == 0)
-        return NGX_DECLINED;
-
-    p = rule->substitution.data;
-    end = p + rule->substitution.len;
-    d = res;
-
     while (p < end && rlen < HTA_MAX_PATH - 1) {
-        if (*p == '$' && p + 1 < end && *(p+1) >= '0' && *(p+1) <= '9') {
+        if (*p == '$' && p + 1 < end && *(p+1) >= '0' && *(p+1) <= '9'
+            && br && br->have_rule)
+        {
             ngx_uint_t n = *(p+1) - '0';
             p += 2;
-            if (n < ncaps / 2) {
-                int s = caps[n*2], e = caps[n*2+1];
+            if (n < br->rule_ncaps / 2) {
+                int s = br->rule_caps[n*2], e = br->rule_caps[n*2+1];
                 if (s >= 0 && e >= s) {
                     ngx_uint_t blen = e - s;
                     if (rlen + blen < HTA_MAX_PATH - 1) {
-                        ngx_memcpy(d, uri->data + s, blen);
+                        ngx_memcpy(d, br->rule_subject.data + s, blen);
+                        d += blen; rlen += blen;
+                    }
+                }
+            }
+        } else if (*p == '%' && p + 1 < end && *(p+1) >= '0' && *(p+1) <= '9'
+                   && br && br->have_cond)
+        {
+            ngx_uint_t n = *(p+1) - '0';
+            p += 2;
+            if (n < br->cond_ncaps / 2) {
+                int s = br->cond_caps[n*2], e = br->cond_caps[n*2+1];
+                if (s >= 0 && e >= s) {
+                    ngx_uint_t blen = e - s;
+                    if (rlen + blen < HTA_MAX_PATH - 1) {
+                        ngx_memcpy(d, br->cond_subject.data + s, blen);
                         d += blen; rlen += blen;
                     }
                 }
@@ -191,11 +294,26 @@ hta_substitute(ngx_http_request_t *r, hta_rule_t *rule, ngx_str_t *uri,
     }
 
     *d = '\0';
-    uri->data = ngx_pnalloc(r->pool, rlen + 1);
-    if (uri->data == NULL) return NGX_ERROR;
-    ngx_memcpy(uri->data, res, rlen + 1);
-    uri->len = rlen;
+    dst->data = ngx_pnalloc(r->pool, rlen + 1);
+    if (dst->data == NULL) return NGX_ERROR;
+    ngx_memcpy(dst->data, res, rlen + 1);
+    dst->len = rlen;
     return NGX_OK;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Substitution with backreferences ($1..$9, %1..%9) and variables (%{VAR})
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static ngx_int_t
+hta_substitute(ngx_http_request_t *r, hta_rule_t *rule, ngx_str_t *uri,
+    hta_backref_t *br)
+{
+    if (ngx_strcmp(rule->substitution.data, "-") == 0)
+        return NGX_DECLINED;
+
+    return hta_expand_full(r, &rule->substitution, uri, br);
 }
 
 
@@ -209,7 +327,8 @@ hta_substitute(ngx_http_request_t *r, hta_rule_t *rule, ngx_str_t *uri,
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static ngx_int_t
-hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule)
+hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule, hta_backref_t *br,
+    int *cond_caps, ngx_str_t *cond_subject)
 {
     ngx_uint_t i;
     ngx_int_t  final_result = 1;
@@ -222,18 +341,39 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule)
         hta_cond_t *c;
         ngx_int_t   match;
         ngx_str_t   expanded;
+        ngx_str_t   rhs;
 
         c = &rule->conds[i];
         match = 0;
-        if (hta_expand_vars(r, &c->test_string, &expanded) != NGX_OK)
+        /* expand %{VAR} and, since the rule pattern was matched first, $N
+         * backreferences from the rule (e.g. CodeIgniter "RewriteCond $1 ...") */
+        if (hta_expand_full(r, &c->test_string, &expanded, br) != NGX_OK)
             return NGX_ERROR;
+
+        /* comparison operators: the RHS operand may itself reference
+         * %{VAR}/$N/%N (e.g. "RewriteCond %{HTTP_HOST} =%{SERVER_NAME}") */
+        rhs = c->cond_pattern;
+        if (c->test_type >= HTA_TEST_STR_EQ
+            && hta_expand_full(r, &c->cond_pattern, &rhs, br) != NGX_OK)
+            rhs = c->cond_pattern;
 
         switch (c->test_type) {
         case HTA_TEST_REGEX:
             if (c->regex) {
-                int caps[HTA_MAX_CAPTURES];
-                match = (ngx_regex_exec(c->regex, &expanded, caps,
-                                        HTA_MAX_CAPTURES) >= 0);
+                int       lcaps[HTA_MAX_CAPTURES];
+                ngx_int_t nrc = ngx_regex_exec(c->regex, &expanded, lcaps,
+                                               HTA_MAX_CAPTURES);
+                match = (nrc >= 0);
+                if (match && !(c->flags & HTA_CF_NEGATE)) {
+                    /* remember captures for %1-%9 in the substitution; the
+                     * last positively-matched RewriteCond wins (Apache) */
+                    ngx_memcpy(cond_caps, lcaps, sizeof(int) * HTA_MAX_CAPTURES);
+                    *cond_subject     = expanded;
+                    br->cond_caps     = cond_caps;
+                    br->cond_subject  = *cond_subject;
+                    br->cond_ncaps    = (nrc > 0) ? (ngx_uint_t) nrc * 2 : 2;
+                    br->have_cond     = 1;
+                }
             }
             break;
         case HTA_TEST_FILE: {
@@ -269,6 +409,41 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule)
             if (ngx_strstr(expanded.data, "..") != NULL) break;
             match = (ngx_file_info(expanded.data, &fi) == 0
                      && ngx_file_size(&fi) > 0);
+            break;
+        }
+        case HTA_TEST_STR_EQ:
+            match = (ngx_strcmp(expanded.data, rhs.data) == 0);
+            break;
+        case HTA_TEST_STR_LT:
+            match = (ngx_strcmp(expanded.data, rhs.data) < 0);
+            break;
+        case HTA_TEST_STR_GT:
+            match = (ngx_strcmp(expanded.data, rhs.data) > 0);
+            break;
+        case HTA_TEST_STR_LE:
+            match = (ngx_strcmp(expanded.data, rhs.data) <= 0);
+            break;
+        case HTA_TEST_STR_GE:
+            match = (ngx_strcmp(expanded.data, rhs.data) >= 0);
+            break;
+        case HTA_TEST_INT_EQ:
+        case HTA_TEST_INT_NE:
+        case HTA_TEST_INT_LT:
+        case HTA_TEST_INT_LE:
+        case HTA_TEST_INT_GT:
+        case HTA_TEST_INT_GE: {
+            ngx_int_t a = ngx_atoi(expanded.data, expanded.len);
+            ngx_int_t b = ngx_atoi(rhs.data, rhs.len);
+            if (a == NGX_ERROR) a = 0;
+            if (b == NGX_ERROR) b = 0;
+            switch (c->test_type) {
+            case HTA_TEST_INT_EQ: match = (a == b); break;
+            case HTA_TEST_INT_NE: match = (a != b); break;
+            case HTA_TEST_INT_LT: match = (a <  b); break;
+            case HTA_TEST_INT_LE: match = (a <= b); break;
+            case HTA_TEST_INT_GT: match = (a >  b); break;
+            default:              match = (a >= b); break;  /* -ge */
+            }
             break;
         }
         }
@@ -352,6 +527,41 @@ hta_apply_dirindex(ngx_http_request_t *r, hta_parsed_t *h)
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * FallbackResource - serve a front controller when the request maps to no
+ * existing file (mod_dir). $request_uri stays the original, so the app still
+ * sees the routed path (same as nginx `try_files $uri /index.php`).
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+ngx_int_t
+hta_apply_fallback(ngx_http_request_t *r, ngx_str_t *fallback)
+{
+    ngx_str_t       path;
+    size_t          rl;
+    u_char         *last;
+    ngx_file_info_t fi;
+
+    if (fallback->len == 0) return NGX_DECLINED;
+
+    /* avoid an internal-redirect loop onto the fallback itself */
+    if (r->uri.len == fallback->len
+        && ngx_strncmp(r->uri.data, fallback->data, fallback->len) == 0)
+        return NGX_DECLINED;
+
+    /* only fall back when the request maps to no existing file or directory */
+    if (ngx_strnstr(r->uri.data, "..", r->uri.len) != NULL) return NGX_DECLINED;
+    last = ngx_http_map_uri_to_path(r, &path, &rl, 1);
+    if (last != NULL) {
+        *last = '\0';
+        if (ngx_file_info(path.data, &fi) == 0
+            && (ngx_is_file(&fi) || ngx_is_dir(&fi)))
+            return NGX_DECLINED;
+    }
+
+    return ngx_http_internal_redirect(r, fallback, &r->args);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Rewrite rules engine
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -363,6 +573,7 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
     int        caps[HTA_MAX_CAPTURES];
     ngx_int_t  rc;
     ngx_uint_t skip = 0;
+    unsigned   changed = 0;
 
     if (!h->rewrite_on || h->nrules == 0) return NGX_DECLINED;
 
@@ -382,28 +593,20 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
     }
 
     for (i = 0; i < h->nrules; i++) {
-        hta_rule_t *rule;
-        ngx_str_t   nuri;
-        ngx_str_t   nargs;
-        u_char     *q;
+        hta_rule_t   *rule;
+        ngx_str_t     nuri;
+        ngx_str_t     nargs;
+        u_char       *q;
+        hta_backref_t br;
+        int           cond_caps[HTA_MAX_CAPTURES];
+        ngx_str_t     cond_subject = ngx_null_string;
 
         rule = &h->rules[i];
 
         if (skip > 0) { skip--; continue; }
 
-        /* check conditions */
-        rc = hta_eval_conds(r, rule);
-        if (rc == NGX_DECLINED) {
-            if (rule->flags & HTA_F_CHAIN) {
-                ngx_uint_t j = i + 1;
-                while (j < h->nrules && h->rules[j-1].flags & HTA_F_CHAIN) j++;
-                i = j - 1;
-            }
-            continue;
-        }
-        if (rc == NGX_ERROR) return NGX_ERROR;
-
-        /* match pattern */
+        /* Apache evaluates the RewriteRule pattern FIRST; the RewriteConds run
+         * only if it matches, and can back-reference its captures via $N. */
         rc = ngx_regex_exec(rule->regex, &uri, caps, HTA_MAX_CAPTURES);
         if (rc == NGX_REGEX_NO_MATCHED) {
             if (rule->flags & HTA_F_CHAIN) {
@@ -414,6 +617,28 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
             continue;
         }
         if (rc < 0) continue;
+
+        ngx_memzero(&br, sizeof(br));
+        br.rule_subject = uri;
+        br.rule_caps    = caps;
+        br.rule_ncaps   = (rc > 0) ? (ngx_uint_t) rc * 2 : 2;
+        br.have_rule    = 1;
+
+        /* now the conditions (they see $N from the rule and capture %N) */
+        {
+            ngx_int_t crc = hta_eval_conds(r, rule, &br, cond_caps,
+                                           &cond_subject);
+            if (crc == NGX_DECLINED) {
+                if (rule->flags & HTA_F_CHAIN) {
+                    ngx_uint_t j = i + 1;
+                    while (j < h->nrules
+                           && h->rules[j-1].flags & HTA_F_CHAIN) j++;
+                    i = j - 1;
+                }
+                continue;
+            }
+            if (crc == NGX_ERROR) return NGX_ERROR;
+        }
 
         /* === matched === */
 
@@ -432,8 +657,13 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
                 hash = ngx_hash_key(vname.data, vname.len);
                 vv = ngx_http_get_variable(r, &vname, hash);
                 if (vv) {
-                    vv->data = rule->env_val.data;
-                    vv->len = rule->env_val.len;
+                    /* the E= value may reference %{VAR}/$N/%N, e.g.
+                     * [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}] */
+                    ngx_str_t ev;
+                    if (hta_expand_full(r, &rule->env_val, &ev, &br) != NGX_OK)
+                        ev = rule->env_val;
+                    vv->data = ev.data;
+                    vv->len = ev.len;
                     vv->valid = 1;
                     vv->not_found = 0;
                     vv->no_cacheable = 0;
@@ -444,9 +674,19 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
         if (rule->flags & HTA_F_FORBIDDEN) return NGX_HTTP_FORBIDDEN;
         if (rule->flags & HTA_F_GONE)      return 410;
 
+        /* [R=4xx/5xx]: respond with the status directly (before substitution),
+         * so the "- [R=404]" / "x - [R=403]" hide-file idiom actually returns
+         * the error instead of silently no-op'ing when the substitution is "-"
+         * and serving the "hidden" resource. */
+        if ((rule->flags & HTA_F_REDIRECT)
+            && rule->redirect_code >= 400 && rule->redirect_code <= 599)
+        {
+            return rule->redirect_code;
+        }
+
         /* apply substitution */
         nuri = uri;
-        rc = hta_substitute(r, rule, &nuri, caps, rc * 2);
+        rc = hta_substitute(r, rule, &nuri, &br);
         if (rc == NGX_DECLINED) {
             if (rule->flags & (HTA_F_LAST | HTA_F_END)) break;
             if (rule->flags & HTA_F_SKIP) skip = rule->skip_count;
@@ -467,15 +707,22 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
 
             if (code < 300 || code > 399) code = 302;
 
-            /* QSA */
-            if ((rule->flags & HTA_F_QSA) && r->args.len > 0) {
-                u_char  sep = ngx_strchr(nuri.data, '?') ? '&' : '?';
-                u_char *quri = ngx_pnalloc(r->pool,
-                                           nuri.len + 1 + r->args.len + 1);
-                if (quri) {
-                    nuri.len = ngx_sprintf(quri, "%V%c%V",
-                                           &nuri, sep, &r->args) - quri;
-                    nuri.data = quri;
+            /* Query string: Apache appends the original ?query to a redirect
+             * target that has none (default passthrough); [QSA] also merges it
+             * onto a target that already has a query; [QSD] discards it. The
+             * old code only handled QSA, so canonical www/HTTPS 301s silently
+             * dropped ?args. */
+            if (!(rule->flags & HTA_F_QSD) && r->args.len > 0) {
+                u_char *has_q = (u_char *) ngx_strchr(nuri.data, '?');
+                if (has_q == NULL || (rule->flags & HTA_F_QSA)) {
+                    u_char  sep = has_q ? '&' : '?';
+                    u_char *quri = ngx_pnalloc(r->pool,
+                                               nuri.len + 1 + r->args.len + 1);
+                    if (quri) {
+                        nuri.len = ngx_sprintf(quri, "%V%c%V",
+                                               &nuri, sep, &r->args) - quri;
+                        nuri.data = quri;
+                    }
                 }
             }
 
@@ -547,6 +794,7 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
         /* continue with rewritten URI */
         r->uri = nuri;
         r->args = nargs;
+        changed = 1;
         uri = nuri;
         if (uri.len > 0 && uri.data[0] == '/') {
             if (h->rewrite_base.len > 0 && uri.len >= h->rewrite_base.len &&
@@ -559,6 +807,18 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
                 uri.data++; uri.len--;
             }
         }
+    }
+
+    /* A rule rewrote the URI but none carried [L]/[END]. Apache re-runs the
+     * per-directory ruleset on the new URI; the nginx equivalent is to flag the
+     * URI changed so the location is matched again. Without this nginx stays in
+     * the original location and could serve the rewritten target (e.g. a .php
+     * file) through the static handler - a source-disclosure hazard. nginx caps
+     * the number of re-walks (then 500), matching Apache's redirect limit. */
+    if (changed) {
+        r->valid_location = 0;
+        r->valid_unparsed_uri = 0;
+        r->uri_changed = 1;
     }
 
     return NGX_DECLINED;
@@ -732,10 +992,30 @@ hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h)
         }
 
         /* match regex against attribute value */
-        if (se->regex && test_val.len > 0
-            && ngx_regex_exec(se->regex, &test_val, NULL, 0) >= 0)
-        {
-            hta_assign_env(r, &se->env_name, &se->env_value, se->unset);
+        if (se->regex && test_val.len > 0) {
+            int       caps[HTA_MAX_CAPTURES];
+            ngx_int_t nrc = ngx_regex_exec(se->regex, &test_val, caps,
+                                           HTA_MAX_CAPTURES);
+            if (nrc >= 0) {
+                ngx_str_t value = se->env_value;
+                /* expand $1-$9 from the match into the env value, e.g.
+                 * SetEnvIfNoCase ^Authorization$ "(.+)" XAUTH=$1 (Nextcloud) */
+                if (!se->unset && se->env_value.len > 0
+                    && ngx_strlchr(se->env_value.data,
+                           se->env_value.data + se->env_value.len, '$') != NULL)
+                {
+                    hta_backref_t br;
+                    ngx_memzero(&br, sizeof(br));
+                    br.rule_subject = test_val;
+                    br.rule_caps    = caps;
+                    br.rule_ncaps   = (nrc > 0) ? (ngx_uint_t) nrc * 2 : 2;
+                    br.have_rule    = 1;
+                    if (hta_expand_full(r, &se->env_value, &value, &br)
+                        != NGX_OK)
+                        value = se->env_value;
+                }
+                hta_assign_env(r, &se->env_name, &value, se->unset);
+            }
         }
     }
 }
@@ -809,6 +1089,60 @@ hta_repoint_indexed(ngx_http_request_t *r, ngx_str_t *name,
     }
 }
 
+/* Expand %{NAME} / %{NAME}e / %{NAME}s specifiers in a Header/RequestHeader
+ * value by looking NAME up as an nginx variable (covers env vars populated by
+ * SetEnv/SetEnvIf and built-in vars), e.g. Nextcloud's
+ * "RequestHeader set Authorization %{XAUTH}e". No '%' -> returned unchanged. */
+static ngx_int_t
+hta_expand_hdr_value(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst)
+{
+    u_char    *p = src->data, *end = src->data + src->len;
+    u_char     res[HTA_MAX_PATH];
+    u_char    *d = res;
+    ngx_uint_t rlen = 0;
+
+    if (ngx_strlchr(src->data, end, '%') == NULL) { *dst = *src; return NGX_OK; }
+
+    while (p < end && rlen < HTA_MAX_PATH - 1) {
+        if (*p == '%' && p + 1 < end && *(p+1) == '{') {
+            u_char *ns = p + 2, *ne = ns;
+            while (ne < end && *ne != '}') ne++;
+            if (ne < end) {
+                ngx_str_t  lname;
+                ngx_uint_t k, hash;
+                ngx_http_variable_value_t *vv;
+
+                p = ne + 1;
+                /* optional trailing format specifier: e (env) / s (ssl/var) */
+                if (p < end && (*p=='e' || *p=='s' || *p=='E' || *p=='S')) p++;
+
+                lname.len  = ne - ns;
+                lname.data = ngx_pnalloc(r->pool, lname.len ? lname.len : 1);
+                if (lname.data && lname.len) {
+                    for (k = 0; k < lname.len; k++)
+                        lname.data[k] = ngx_tolower(ns[k]);
+                    hash = ngx_hash_key(lname.data, lname.len);
+                    vv = ngx_http_get_variable(r, &lname, hash);
+                    if (vv && !vv->not_found && vv->len > 0
+                        && rlen + vv->len < HTA_MAX_PATH - 1)
+                    {
+                        ngx_memcpy(d, vv->data, vv->len);
+                        d += vv->len; rlen += vv->len;
+                    }
+                }
+            } else { *d++ = *p++; rlen++; }
+        } else { *d++ = *p++; rlen++; }
+    }
+
+    *d = '\0';
+    dst->data = ngx_pnalloc(r->pool, rlen + 1);
+    if (dst->data == NULL) return NGX_ERROR;
+    ngx_memcpy(dst->data, res, rlen + 1);
+    dst->len = rlen;
+    return NGX_OK;
+}
+
+
 void
 hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
 {
@@ -819,7 +1153,10 @@ hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
     if (h->nreq_headers == 0) return;
 
     for (i = 0; i < h->nreq_headers; i++) {
+        ngx_str_t hv;
+
         hd = &h->req_headers[i];
+        if (hta_expand_hdr_value(r, &hd->value, &hv) != NGX_OK) hv = hd->value;
 
         switch (hd->action) {
         case HTA_HDR_UNSET:
@@ -848,7 +1185,7 @@ hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
             if (elt == NULL) return;
             ngx_memzero(elt, sizeof(ngx_table_elt_t));
             elt->key   = hd->name;
-            elt->value = hd->value;
+            elt->value = hv;
             elt->hash  = 1;
             /* nginx hashes lowercase header names for indexed lookups */
             elt->lowcase_key = ngx_pnalloc(r->pool, hd->name.len);
@@ -865,10 +1202,10 @@ hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
              * append a fresh entry like APPEND */
             ngx_table_elt_t *existing = hta_find_req_header(r, &hd->name);
             if (existing
-                && hd->value.len > 0
-                && existing->value.len >= hd->value.len
+                && hv.len > 0
+                && existing->value.len >= hv.len
                 && ngx_strnstr(existing->value.data,
-                       (char *)hd->value.data, existing->value.len) != NULL)
+                       (char *)hv.data, existing->value.len) != NULL)
             {
                 break;
             }
@@ -876,7 +1213,7 @@ hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
             if (elt == NULL) return;
             ngx_memzero(elt, sizeof(ngx_table_elt_t));
             elt->key   = hd->name;
-            elt->value = hd->value;
+            elt->value = hv;
             elt->hash  = 1;
             elt->lowcase_key = ngx_pnalloc(r->pool, hd->name.len);
             if (elt->lowcase_key) {
@@ -953,6 +1290,20 @@ hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h)
                 target = rd->target;
             }
 
+            /* mod_alias appends the original query string to the target */
+            if (target.len > 0 && r->args.len > 0
+                && ngx_strlchr(target.data, target.data + target.len, '?')
+                   == NULL)
+            {
+                u_char *qt = ngx_pnalloc(r->pool,
+                                         target.len + 1 + r->args.len + 1);
+                if (qt) {
+                    target.len = ngx_sprintf(qt, "%V?%V",
+                                             &target, &r->args) - qt;
+                    target.data = qt;
+                }
+            }
+
             loc = ngx_list_push(&r->headers_out.headers);
             if (loc == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
             loc->hash = 1;
@@ -990,6 +1341,20 @@ hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h)
                                r->uri.data + rd->source.len, tail_len);
                 }
                 target.data[target.len] = '\0';
+
+                /* mod_alias appends the original query string to the target */
+                if (target.len > 0 && r->args.len > 0
+                    && ngx_strlchr(target.data, target.data + target.len, '?')
+                       == NULL)
+                {
+                    u_char *qt = ngx_pnalloc(r->pool,
+                                             target.len + 1 + r->args.len + 1);
+                    if (qt) {
+                        target.len = ngx_sprintf(qt, "%V?%V",
+                                                 &target, &r->args) - qt;
+                        target.data = qt;
+                    }
+                }
 
                 loc = ngx_list_push(
                                         &r->headers_out.headers);

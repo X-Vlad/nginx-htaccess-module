@@ -1,0 +1,3 @@
+AuthType Digest
+AuthName "Restricted"
+Require valid-user

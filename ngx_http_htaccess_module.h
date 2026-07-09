@@ -67,6 +67,19 @@
 #define HTA_TEST_LINK         3
 #define HTA_TEST_EXISTS       4
 #define HTA_TEST_SIZE         5
+/* lexicographic string comparison (=, <, >, <=, >=) */
+#define HTA_TEST_STR_EQ       6
+#define HTA_TEST_STR_LT       7
+#define HTA_TEST_STR_GT       8
+#define HTA_TEST_STR_LE       9
+#define HTA_TEST_STR_GE       10
+/* integer comparison (-eq, -ne, -lt, -le, -gt, -ge) */
+#define HTA_TEST_INT_EQ       11
+#define HTA_TEST_INT_NE       12
+#define HTA_TEST_INT_LT       13
+#define HTA_TEST_INT_LE       14
+#define HTA_TEST_INT_GT       15
+#define HTA_TEST_INT_GE       16
 
 /* Access order */
 #define HTA_ORDER_DENY_ALLOW  0
@@ -118,6 +131,8 @@ typedef struct {
     ngx_uint_t   action;
     ngx_str_t    name;
     ngx_str_t    value;
+    ngx_str_t    cond_env;      /* "env=VAR": apply only when VAR is set */
+    unsigned     cond_negate:1; /* "env=!VAR": apply only when VAR is unset */
 } hta_header_t;
 
 typedef struct {
@@ -129,6 +144,7 @@ typedef struct {
 typedef struct {
     ngx_str_t    value;
     unsigned     is_allow:1;
+    unsigned     is_require:1;   /* came from "Require ip/host/env", not Allow/Deny */
 } hta_access_t;
 
 typedef struct {
@@ -164,15 +180,19 @@ typedef struct {
     ngx_regex_t *regex;
     unsigned     is_regex:1;
     /* access control */
-    unsigned     has_acl:1;
+    unsigned     has_acl:1;         /* mod_access_compat Allow/Deny/Order present */
     unsigned     require_denied:1;
     unsigned     require_granted:1;
+    unsigned     has_require_host:1; /* Require ip/host/env present */
+    unsigned     require_local:1;    /* Require local */
+    unsigned     require_failed:1;   /* unsupported Require provider -> fail closed */
     ngx_uint_t   access_order;
     hta_access_t acl[HTA_MAX_FB_ACL];
     ngx_uint_t   nacl;
     /* auth */
     unsigned     auth_basic:1;
     unsigned     auth_valid_user:1;
+    unsigned     auth_type_unsupported:1; /* AuthType set to a non-Basic scheme */
     ngx_str_t    auth_name;
     ngx_str_t    auth_user_file;
     ngx_str_t    auth_group_file;
@@ -187,6 +207,8 @@ typedef struct {
     ngx_str_t    force_type;
     hta_addtype_t addtypes[8];
     ngx_uint_t    naddtypes;
+    /* SetHandler none / RemoveHandler: block script execution for this block */
+    unsigned      exec_disabled:1;
 } hta_files_block_t;
 
 typedef struct {
@@ -204,12 +226,16 @@ typedef struct {
     unsigned     has_acl:1;
     unsigned     require_denied:1;
     unsigned     require_granted:1;
+    unsigned     has_require_host:1;
+    unsigned     require_local:1;
+    unsigned     require_failed:1;
     ngx_uint_t   access_order;
     hta_access_t acl[HTA_MAX_LB_ACL];
     ngx_uint_t   nacl;
     /* auth inside the block */
     unsigned     auth_basic:1;
     unsigned     auth_valid_user:1;
+    unsigned     auth_type_unsupported:1;
     ngx_str_t    auth_name;
     ngx_str_t    auth_user_file;
     ngx_str_t    auth_group_file;
@@ -245,9 +271,14 @@ typedef struct {
     ngx_uint_t        access_order;
     hta_access_t      acl[HTA_MAX_USERS];
     ngx_uint_t        nacl;
-    unsigned          has_acl:1;
+    unsigned          has_acl:1;          /* mod_access_compat Allow/Deny/Order */
     unsigned          require_granted:1;
     unsigned          require_denied:1;
+    unsigned          has_require_host:1; /* Require ip/host/env present */
+    unsigned          require_local:1;    /* Require local */
+    unsigned          require_failed:1;   /* unsupported Require provider -> deny */
+    unsigned          has_unknown:1;      /* saw an unrecognized directive */
+    unsigned          in_require_none:1;  /* transient: parsing inside <RequireNone> */
 
     /* response headers */
     hta_header_t      headers[HTA_MAX_HEADERS];
@@ -260,6 +291,7 @@ typedef struct {
     /* auth */
     unsigned          auth_basic:1;
     unsigned          auth_valid_user:1;
+    unsigned          auth_type_unsupported:1; /* AuthType set to a non-Basic scheme */
     ngx_str_t         auth_name;
     ngx_str_t         auth_user_file;
     ngx_str_t         auth_users[HTA_MAX_USERS];
@@ -310,8 +342,15 @@ typedef struct {
     /* AddDefaultCharset */
     ngx_str_t         default_charset;
 
+    /* FallbackResource - front-controller target when the file is absent */
+    ngx_str_t         fallback_resource;
+
     /* SSLRequireSSL - require HTTPS */
     unsigned          ssl_required:1;
+
+    /* SetHandler none / RemoveHandler .php / php_flag engine off:
+     * block script (PHP) execution in this scope */
+    unsigned          exec_disabled:1;
 
     /* meta */
     time_t            mtime;
@@ -330,6 +369,8 @@ typedef struct {
 typedef struct {
     ngx_flag_t        enable;
     ngx_str_t         filename;
+    ngx_flag_t        strict;       /* fail closed (500) on unknown directives */
+    ngx_flag_t        trust_proxy;  /* honor X-Forwarded-Proto for SSLRequireSSL */
 } ngx_http_hta_loc_conf_t;
 
 typedef struct {
@@ -392,6 +433,7 @@ ngx_int_t hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src,
 ngx_int_t hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_apply_dirindex(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h);
+ngx_int_t hta_apply_fallback(ngx_http_request_t *r, ngx_str_t *fallback);
 void hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_errdoc(ngx_http_request_t *r, hta_parsed_t *h,
     ngx_int_t status);
@@ -401,9 +443,11 @@ ngx_int_t hta_check_access(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_files_access(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h);
-ngx_int_t hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h);
+ngx_int_t hta_check_ssl(ngx_http_request_t *r, hta_parsed_t *h,
+    ngx_uint_t trust_proxy);
 ngx_int_t hta_check_limit_access(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_check_limit_auth(ngx_http_request_t *r, hta_parsed_t *h);
+ngx_int_t hta_check_exec(ngx_http_request_t *r, hta_parsed_t *h);
 
 /* rewrite.c */
 void hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h);

@@ -1,0 +1,6 @@
+AuthType Basic
+AuthName "Restricted"
+AuthUserFile __HTDOCS_ROOT__/auth/.htpasswd
+<Files locked.html>
+Require user testuser
+</Files>

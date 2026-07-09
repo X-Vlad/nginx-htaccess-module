@@ -1,0 +1,2 @@
+SetEnvIf User-Agent ^CorsClient cors_ok
+Header set X-CORS yes env=cors_ok

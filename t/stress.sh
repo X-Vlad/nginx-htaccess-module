@@ -137,6 +137,21 @@ run_scenario "php_value collection" /php-values/__pv 5000 50 ; :
 # 8. 401 responses (Basic auth WITHOUT credentials) - verifies auth fast-fail
 NON2XX_OK=1 run_scenario "401 fast-fail (no creds)" /auth/protected.html 5000 50
 
+# 9. Rewrite engine: %{HTTP:} lookup + backref-capable substitution path
+run_scenario "RewriteCond %{HTTP:} + backref engine" /sec/vars/page.html 5000 50 ; :
+
+# 10. RewriteCond comparison operator (=) -> external redirect (302)
+NON2XX_OK=1 run_scenario "RewriteCond '=' operator redirect" /sec/eqtest/page.html 5000 50
+
+# 11. FallbackResource internal redirect on a missing file (front controller)
+run_scenario "FallbackResource internal redirect" /sec/fallback/no-such-route 5000 50 ; :
+
+# 12. Access eval: <RequireNone> -> Deny path (non-matching client allowed)
+run_scenario "RequireNone access eval" /sec/reqnone-ok/page.html 5000 50 ; :
+
+# 13. Conditional Header (SetEnvIf-gated CORS) response-header path
+run_scenario "Conditional Header env=" /sec/cors/page.html 5000 50 ; :
+
 # ----------------------------------------------------------------------
 # Post-stress checks
 # ----------------------------------------------------------------------

@@ -3,7 +3,7 @@
 ## Project
 
 Native C module for nginx that adds Apache `.htaccess` support. Linux only
-(inotify, crypt, lstat). Tested on nginx 1.24.0, 1.28.2, 1.30.1.
+(inotify, crypt, lstat). Tested on nginx 1.24.0, 1.28.2, 1.30.3.
 
 ## Build
 
@@ -13,15 +13,16 @@ docker build -t nginx-htaccess-test .
 docker run --rm nginx-htaccess-test
 
 # Native (requires nginx source)
-make build NGINX_VERSION=1.30.1
+make build NGINX_VERSION=1.30.3
 make test
 ```
 
 ## Test
 
 ```bash
-docker run --rm nginx-htaccess-test bash /tests/run_tests.sh
-cd demo && ./demo.sh                              # interactive demos
+docker run --rm nginx-htaccess-test bash /tests/t/run_tests.sh
+docker run --rm nginx-htaccess-test bash /tests/t/stress.sh   # load/leak test
+cd demo && ./demo.sh                                          # interactive demos
 ```
 
 ## Project structure (flat, nginx convention)
@@ -33,7 +34,7 @@ cd demo && ./demo.sh                              # interactive demos
 - `ngx_http_htaccess_header.c` - response header filter, AddType, Expires
 - `ngx_http_htaccess_cache.c` - per-worker parsed cache + inotify
 - `config` - nginx build integration
-- `t/` - shell-based tests (125+ cases)
+- `t/` - shell-based tests (165+ cases)
 - `demo/` - Docker demos (simple + WordPress)
 
 ## Code style
@@ -50,7 +51,7 @@ cd demo && ./demo.sh                              # interactive demos
 - Decoded `Basic` `user:pass` blob zeroed before auth handler returns
 - Path-traversal guards on `AuthUserFile`, `AuthGroupFile`, URI traversal,
   REQUEST_FILENAME expansion, all file-test conditions (-f, -d, -l, -e, -s)
-- Direct access to `.htaccess`/`.htpasswd`/`.htgroup`/`.htdigest` -> 403
+- Direct access to any `.ht*` basename -> 403 (incl. backups like `.htpasswd.bak`)
 - File-size cap: 1 MB on `.htaccess` / `.htpasswd` / `.htgroup`
 - `Require group` inside `<Files>` / `<Limit>` IS propagated (bypass class)
 - CR/LF stripped from `Header` and `RequestHeader` values at parse time
