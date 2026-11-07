@@ -1,0 +1,5 @@
+# Normalize line endings in the repository.  nginx module sources, shell
+# scripts, configs and fixtures are LF; Windows batch files stay CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

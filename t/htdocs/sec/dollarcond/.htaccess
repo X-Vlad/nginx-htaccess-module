@@ -1,3 +1,4 @@
 RewriteEngine On
 RewriteCond $1 ^secret
-RewriteRule ^.*/([^/]+)$ /found [R=302,L]
+# Per-directory matching is relative to this directory (Apache semantics).
+RewriteRule ^(.+)$ /found [R=302,L]

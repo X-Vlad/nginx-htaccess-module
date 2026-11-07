@@ -24,6 +24,13 @@ NC='\033[0m'
 MODULE_NAME="ngx_http_htaccess_module"
 MODULE_SO="${MODULE_NAME}.so"
 MODULE_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR=""
+CONF_BACKUP=""
+
+# nginx does not publish .sha256 files, only PGP signatures.  Pin the hashes
+# for the versions used by CI, and verify the PGP signature for anything else.
+NGINX_SHA256_1_28_0="c6b5c6b086c0df9d3ca3ff5e084c1d0ef909e6038279c71c1c3e985f576ff76a"
+NGINX_SHA256_1_28_2="20e5e0f2c917acfb51120eec2fba9a4ba4e1e10fd28465067cc87a7d81a829a3"
 
 # Common nginx module paths
 MODULES_PATHS=(
@@ -238,27 +245,82 @@ REPO
 }
 
 # ============================================================================
+# Verify downloaded nginx source
+# ============================================================================
+
+verify_nginx_source() {
+    local file="$1" version="$2" expected=""
+
+    case "$version" in
+        1.28.0) expected="$NGINX_SHA256_1_28_0" ;;
+        1.28.2) expected="$NGINX_SHA256_1_28_2" ;;
+        *)      expected="${NGINX_SHA256:-}" ;;
+    esac
+
+    if [ -n "$expected" ]; then
+        if echo "${expected}  ${file}" | sha256sum -c - >/dev/null 2>&1; then
+            log_info "Source SHA256 verified."
+            return 0
+        fi
+        log_error "nginx source checksum mismatch for $version."
+        return 1
+    fi
+
+    if command -v gpg &>/dev/null; then
+        local gnupg="${BUILD_DIR}/gnupg"
+
+        mkdir -p "$gnupg"
+        chmod 700 "$gnupg"
+
+        log_info "Verifying nginx source PGP signature..."
+        if wget -q https://nginx.org/keys/nginx_signing.key \
+                -O "${BUILD_DIR}/nginx.key" \
+           && GNUPGHOME="$gnupg" gpg --batch --quiet --import \
+                "${BUILD_DIR}/nginx.key" 2>/dev/null \
+           && wget -q "https://nginx.org/download/nginx-${version}.tar.gz.asc" \
+                -O "${BUILD_DIR}/nginx.tar.gz.asc" \
+           && GNUPGHOME="$gnupg" gpg --batch --verify \
+                "${BUILD_DIR}/nginx.tar.gz.asc" "$file" >/dev/null 2>&1
+        then
+            log_info "PGP signature verified."
+            return 0
+        fi
+        log_warn "GPG verification failed; refusing to build from this tarball."
+        return 1
+    fi
+
+    log_error "No checksum available for nginx $version and gpg is not installed."
+    log_error "Set NGINX_SHA256=<sha256 of the tarball> and re-run."
+    return 1
+}
+
+
+# ============================================================================
 # Build module
 # ============================================================================
 
 build_module() {
     local version="$1"
-    local build_dir="/tmp/nginx-htaccess-build"
 
     log_step "Building module for nginx $version..."
 
-    # Clean previous build
-    rm -rf "$build_dir"
-    mkdir -p "$build_dir"
-    cd "$build_dir"
+    BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nginx-htaccess-build.XXXXXX")"
+    if [ -z "$BUILD_DIR" ] || [ ! -d "$BUILD_DIR" ]; then
+        log_error "Failed to create a private build directory."
+        return 1
+    fi
+    cd "$BUILD_DIR"
 
-    # Download nginx source
     local url="https://nginx.org/download/nginx-${version}.tar.gz"
     log_info "Downloading nginx source: $url"
 
     if ! wget -q "$url" -O nginx.tar.gz; then
         log_error "Failed to download nginx $version source."
         log_warn "Check version at: https://nginx.org/en/download.html"
+        return 1
+    fi
+
+    if ! verify_nginx_source "${BUILD_DIR}/nginx.tar.gz" "$version"; then
         return 1
     fi
 
@@ -292,7 +354,7 @@ build_module() {
         return 1
     fi
 
-    BUILT_MODULE="$build_dir/nginx-${version}/objs/${MODULE_SO}"
+    BUILT_MODULE="$BUILD_DIR/nginx-${version}/objs/${MODULE_SO}"
     log_info "Build successful: $BUILT_MODULE"
 }
 
@@ -325,6 +387,10 @@ install_module() {
     if [ -n "$NGINX_CONF" ] && [ -f "$NGINX_CONF" ]; then
         if ! grep -q "$MODULE_SO" "$NGINX_CONF"; then
             log_info "Adding load_module to $NGINX_CONF..."
+
+            CONF_BACKUP="${NGINX_CONF}.htaccess-backup.$(date +%s)"
+            cp -a "$NGINX_CONF" "$CONF_BACKUP"
+            log_info "nginx.conf backed up to: $CONF_BACKUP"
 
             local module_path
             # Use relative path if modules dir is standard
@@ -495,7 +561,9 @@ uninstall_module() {
 # ============================================================================
 
 cleanup() {
-    rm -rf /tmp/nginx-htaccess-build 2>/dev/null
+    if [ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ]; then
+        rm -rf "$BUILD_DIR" 2>/dev/null
+    fi
 }
 
 # ============================================================================
@@ -597,7 +665,13 @@ main() {
     install_module
 
     # Verify
-    verify_install
+    if ! verify_install; then
+        if [ -n "$CONF_BACKUP" ] && [ -f "$CONF_BACKUP" ]; then
+            cp -a "$CONF_BACKUP" "$NGINX_CONF"
+            log_warn "Restored nginx.conf from $CONF_BACKUP"
+        fi
+        exit 1
+    fi
 
     # Cleanup
     cleanup

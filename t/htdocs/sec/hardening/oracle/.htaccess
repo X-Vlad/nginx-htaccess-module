@@ -1,0 +1,5 @@
+RewriteEngine On
+RewriteBase /sec/hardening/oracle/
+RewriteCond %{QUERY_STRING} ^p=(.+)$
+RewriteCond /%1 -f
+RewriteRule ^any$ /sec/hardening/oracle/yes.html [L]

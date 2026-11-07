@@ -2,6 +2,19 @@
 title nginx-htaccess-module Demo Manager
 cd /d "%~dp0"
 
+if not exist ".env" (
+    echo [!] demo\.env is missing.
+    echo     Run demo.sh once on Linux/macOS/WSL or create demo\.env with:
+    echo     MYSQL_ROOT_PASSWORD=^<random^>
+    echo     MYSQL_PASSWORD=^<random^>
+    echo     MYSQL_DATABASE=wordpress
+    echo     MYSQL_USER=wp
+    echo.
+    echo     No default demo passwords are shipped.
+    pause
+    exit /b 1
+)
+
 :menu
 cls
 echo ==============================================
@@ -101,7 +114,7 @@ docker compose -f docker-compose.wordpress.yml build
 docker compose -f docker-compose.wordpress.yml up -d
 echo.
 echo WordPress available at: http://localhost:8080
-echo MySQL: host=mysql db=wordpress user=wp pass=wppass
+echo MySQL credentials: see demo\.env
 pause
 goto menu
 
@@ -113,7 +126,7 @@ docker compose -f docker-compose.wordpress.yml build --no-cache
 docker compose -f docker-compose.wordpress.yml up -d
 echo.
 echo WordPress available at: http://localhost:8080
-echo MySQL: host=mysql db=wordpress user=wp pass=wppass
+echo MySQL credentials: see demo\.env
 pause
 goto menu
 

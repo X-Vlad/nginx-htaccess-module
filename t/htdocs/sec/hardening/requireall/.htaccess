@@ -1,0 +1,4 @@
+<RequireAll>
+Require all granted
+Require ip 10.99.99.99
+</RequireAll>

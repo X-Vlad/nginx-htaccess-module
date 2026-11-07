@@ -7,6 +7,9 @@
 
 #include "ngx_http_htaccess_module.h"
 #include <crypt.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <ngx_md5.h>
 #include <ngx_sha1.h>
@@ -154,7 +157,7 @@ hta_verify_password(u_char *plain, size_t plain_len,
     /* ---- {SHA} ---- */
     if (hash_len >= 5 && ngx_strncmp(hash, "{SHA}", 5) == 0) {
         u_char    digest[20];
-        u_char    expected[20];
+        u_char    expected[24];
         ngx_str_t enc, dec;
         ngx_sha1_t sha;
 
@@ -164,10 +167,24 @@ hta_verify_password(u_char *plain, size_t plain_len,
 
         enc.data = hash + 5;
         enc.len  = hash_len - 5;
+
+        /*
+         * ngx_decode_base64() does NOT treat dst->len as a capacity; it
+         * writes as many bytes as src->len decodes to.  expected[] has room
+         * for the 28-char SHA1 base64 form (including '=' padding), and
+         * anything longer is rejected before decode.
+         */
+        if (enc.len == 0 || enc.len > 28
+            || ngx_base64_decoded_length(enc.len) > sizeof(expected))
+        {
+            hta_secure_zero(digest, sizeof(digest));
+            return NGX_DECLINED;
+        }
+
         dec.data = expected;
         dec.len  = sizeof(expected);
         if (ngx_decode_base64(&dec, &enc) != NGX_OK
-            || dec.len != sizeof(expected))
+            || dec.len != 20)
         {
             hta_secure_zero(digest, sizeof(digest));
             return NGX_DECLINED;
@@ -217,7 +234,7 @@ hta_verify_password(u_char *plain, size_t plain_len,
         ngx_memcpy(hbuf, hash, hash_len);
         hbuf[hash_len] = '\0';
 
-        cd.initialized = 0;
+        ngx_memzero(&cd, sizeof(cd));
         cr = crypt_r((char *) pbuf, (char *) hbuf, &cd);
         if (cr != NULL
             && ngx_strlen(cr) == hash_len
@@ -237,21 +254,27 @@ hta_verify_password(u_char *plain, size_t plain_len,
  * IP matching - exact, prefix, CIDR
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/*
+ * Returns 1 on match, 0 on no match, -1 if the address specification is
+ * invalid.  The caller must fail closed for a Deny with an invalid spec.
+ */
 static ngx_int_t
 hta_match_ip(ngx_str_t *client, ngx_str_t *pat)
 {
-    u_char *slash;
+    u_char     *slash;
+    u_char      ibuf[64], cbuf[64], mbuf[64];
+    ngx_uint_t  ilen;
 
     if (ngx_strcasecmp(pat->data, (u_char *)"all") == 0) return 1;
 
-    /* exact match */
+    /* exact textual match */
     if (pat->len == client->len
         && ngx_strncmp(pat->data, client->data, pat->len) == 0)
     {
         return 1;
     }
 
-    /* prefix (e.g., "192.168.") */
+    /* Apache partial prefix with a trailing dot: "192.168." */
     if (pat->len > 0 && pat->data[pat->len - 1] == '.'
         && client->len >= pat->len
         && ngx_strncmp(pat->data, client->data, pat->len) == 0)
@@ -259,55 +282,141 @@ hta_match_ip(ngx_str_t *client, ngx_str_t *pat)
         return 1;
     }
 
-    /* CIDR - IPv4 (e.g., "10.0.0.0/8") and IPv6 (e.g., "::1/128") */
-    slash = (u_char *)ngx_strchr(pat->data, '/');
-    if (slash) {
-        ngx_uint_t bits = ngx_atoi(slash + 1,
-                                    pat->len - (slash + 1 - pat->data));
-        u_char     ibuf[64], cbuf[64];
-        ngx_uint_t ilen = slash - pat->data;
+    if (client->len >= sizeof(cbuf)) return 0;
+    ngx_memcpy(cbuf, client->data, client->len);
+    cbuf[client->len] = '\0';
 
-        if (ilen < 64 && client->len < 64) {
-            ngx_memcpy(ibuf, pat->data, ilen); ibuf[ilen] = '\0';
-            ngx_memcpy(cbuf, client->data, client->len);
-            cbuf[client->len] = '\0';
+    slash = (u_char *) ngx_strchr(pat->data, '/');
 
-            if (bits <= 128) {
-                /* Try IPv4 first, then IPv6 — bits alone can't determine family
-                 * (e.g., fe80::/10 has bits=10 which is also valid for IPv4) */
-                struct in_addr ca, pa;
-                if (bits <= 32
-                    && inet_pton(AF_INET, (char *)ibuf, &pa) == 1
-                    && inet_pton(AF_INET, (char *)cbuf, &ca) == 1)
-                {
-                    uint32_t mask;
-                    if (bits == 0)       mask = 0;
-                    else if (bits == 32) mask = htonl(0xFFFFFFFF);
-                    else                 mask = htonl(~((1U << (32 - bits)) - 1));
-                    if ((ca.s_addr & mask) == (pa.s_addr & mask)) return 1;
-                } else {
-                    /* IPv6 CIDR */
-                    struct in6_addr ca6, pa6;
-                    if (inet_pton(AF_INET6, (char *)ibuf, &pa6) == 1
-                        && inet_pton(AF_INET6, (char *)cbuf, &ca6) == 1)
-                    {
-                        ngx_uint_t j, full = bits / 8, rem = bits % 8;
-                        int        ok = 1;
-                        for (j = 0; j < 16 && ok; j++) {
-                            uint8_t m = (j < full)  ? 0xFF
-                                      : (j == full) ? (rem ? (0xFF << (8 - rem)) & 0xFF : 0)
-                                                    : 0;
-                            if ((ca6.s6_addr[j] & m) != (pa6.s6_addr[j] & m))
-                                ok = 0;
-                        }
-                        if (ok) return 1;
-                    }
+    if (slash != NULL) {
+        ngx_int_t  bits;
+        u_char    *mask;
+        size_t     mlen;
+
+        ilen = slash - pat->data;
+        if (ilen == 0 || ilen >= sizeof(ibuf)) return -1;
+
+        ngx_memcpy(ibuf, pat->data, ilen);
+        ibuf[ilen] = '\0';
+
+        mask = slash + 1;
+        mlen = pat->len - (slash + 1 - pat->data);
+        if (mlen == 0 || mlen >= sizeof(mbuf)) return -1;
+
+        ngx_memcpy(mbuf, mask, mlen);
+        mbuf[mlen] = '\0';
+
+        if (ngx_strchr(mbuf, '.') != NULL) {
+            struct in_addr ca, pa, ma;
+            if (inet_pton(AF_INET, (char *) ibuf, &pa) != 1
+                || inet_pton(AF_INET, (char *) cbuf, &ca) != 1
+                || inet_pton(AF_INET, (char *) mbuf, &ma) != 1)
+            {
+                return -1;
+            }
+            return ((ca.s_addr & ma.s_addr) == (pa.s_addr & ma.s_addr));
+        }
+
+        bits = ngx_atoi(mbuf, ngx_strlen(mbuf));
+        if (bits == NGX_ERROR) return -1;
+
+        {
+            struct in_addr ca, pa;
+
+            if (inet_pton(AF_INET, (char *) ibuf, &pa) == 1) {
+                uint32_t m;
+
+                if (bits > 32) return -1;
+                if (inet_pton(AF_INET, (char *) cbuf, &ca) != 1) return 0;
+
+                if (bits == 0)       m = 0;
+                else if (bits == 32) m = htonl(0xFFFFFFFF);
+                else                 m = htonl(~((1U << (32 - bits)) - 1));
+
+                return ((ca.s_addr & m) == (pa.s_addr & m));
+            }
+        }
+
+        {
+            struct in6_addr ca6, pa6;
+            ngx_uint_t      j, full, rem;
+            int             ok = 1;
+
+            if (inet_pton(AF_INET6, (char *) ibuf, &pa6) != 1) return -1;
+            if (bits > 128) return -1;
+            if (inet_pton(AF_INET6, (char *) cbuf, &ca6) != 1) return 0;
+
+            full = bits / 8;
+            rem  = bits % 8;
+
+            for (j = 0; j < 16; j++) {
+                uint8_t m = (j < full)  ? 0xFF
+                          : (j == full) ? (rem ? (0xFF << (8 - rem)) & 0xFF : 0)
+                                        : 0;
+                if ((ca6.s6_addr[j] & m) != (pa6.s6_addr[j] & m)) {
+                    ok = 0;
+                    break;
                 }
             }
+
+            return ok;
         }
     }
 
-    return 0;
+    /*
+     * Apache also accepts partial addresses without the trailing dot:
+     * "127", "127.0", "127.0.0" mean /8, /16, /24.
+     */
+    {
+        u_char    *p = pat->data;
+        ngx_uint_t parts = 1, digits = 0;
+
+        while (p < pat->data + pat->len) {
+            if (*p == '.') {
+                parts++;
+                digits = 0;
+            } else if (*p >= '0' && *p <= '9') {
+                digits++;
+            } else {
+                parts = 0;
+                break;
+            }
+            p++;
+        }
+
+        if (parts >= 1 && parts <= 3 && digits > 0) {
+            struct in_addr ca, pa;
+            uint32_t       m;
+
+            (void) ngx_snprintf(ibuf, sizeof(ibuf), "%V%s", pat,
+                                parts == 1 ? ".0.0.0" :
+                                parts == 2 ? ".0.0" : ".0");
+
+            if (inet_pton(AF_INET, (char *) ibuf, &pa) != 1) return -1;
+            if (inet_pton(AF_INET, (char *) cbuf, &ca) != 1) return 0;
+
+            m = htonl(parts == 1 ? 0xFF000000U
+                     : parts == 2 ? 0xFFFF0000U : 0xFFFFFF00U);
+            return ((ca.s_addr & m) == (pa.s_addr & m));
+        }
+    }
+
+    /* IPv4 and IPv6 exact textual variants. */
+    {
+        struct in_addr  ca, pa;
+        struct in6_addr ca6, pa6;
+
+        if (inet_pton(AF_INET, (char *) pat->data, &pa) == 1) {
+            return (inet_pton(AF_INET, (char *) cbuf, &ca) == 1
+                    && ca.s_addr == pa.s_addr);
+        }
+        if (inet_pton(AF_INET6, (char *) pat->data, &pa6) == 1) {
+            return (inet_pton(AF_INET6, (char *) cbuf, &ca6) == 1
+                    && ngx_memcmp(&ca6, &pa6, sizeof(ca6)) == 0);
+        }
+    }
+
+    return -1;
 }
 
 
@@ -364,7 +473,18 @@ hta_acl_entry_match(ngx_http_request_t *r, ngx_str_t *cip, hta_access_t *a)
         name.len  = a->value.len - 4;
         return hta_env_is_set(r, &name);
     }
-    return hta_match_ip(cip, &a->value);
+
+    {
+        ngx_int_t rc = hta_match_ip(cip, &a->value);
+        if (rc < 0) {
+            /*
+             * Invalid address specification.  For Deny fail closed (match
+             * everything); for Allow match nothing.
+             */
+            return a->is_allow ? 0 : 1;
+        }
+        return rc;
+    }
 }
 
 
@@ -390,7 +510,7 @@ static ngx_int_t
 hta_eval_acl(ngx_http_request_t *r, hta_access_t *acl, ngx_uint_t nacl,
     ngx_uint_t order, unsigned has_compat, unsigned has_require_host,
     unsigned require_local, unsigned require_failed,
-    unsigned require_granted, unsigned require_denied)
+    unsigned require_granted, unsigned require_denied, unsigned require_all)
 {
     ngx_uint_t i;
     ngx_int_t  compat_ok, host_ok;
@@ -427,19 +547,47 @@ hta_eval_acl(ngx_http_request_t *r, hta_access_t *acl, ngx_uint_t nacl,
         }
     }
 
-    /* Require ip/host/env/local: client must match at least one (RequireAny) */
+    /*
+     * Require ip/host/env/local.  A flat list (and <RequireAny>) is OR;
+     * inside <RequireAll> every requirement must match.  In particular,
+     * "Require all granted" must not waive a sibling "Require ip".
+     */
     host_ok = 1;
-    if (require_granted) {
-        host_ok = 1;
-    } else if (has_require_host || require_local) {
-        host_ok = 0;
-        if (require_local && hta_ip_is_local(&cip)) host_ok = 1;
-        if (!host_ok) {
-            for (i = 0; i < nacl; i++)
-                if (acl[i].is_require
-                    && hta_acl_entry_match(r, &cip, &acl[i]))
-                { host_ok = 1; break; }
+
+    if (has_require_host || require_local) {
+        if (require_all) {
+            host_ok = 1;
+            if (require_local) {
+                if (!hta_ip_is_local(&cip)) host_ok = 0;
+            }
+            if (has_require_host) {
+                for (i = 0; i < nacl; i++) {
+                    if (acl[i].is_require
+                        && !hta_acl_entry_match(r, &cip, &acl[i]))
+                    {
+                        host_ok = 0;
+                        break;
+                    }
+                }
+            }
+        } else {
+            host_ok = 0;
+            if (require_local && hta_ip_is_local(&cip)) host_ok = 1;
+            if (!host_ok) {
+                for (i = 0; i < nacl; i++) {
+                    if (acl[i].is_require
+                        && hta_acl_entry_match(r, &cip, &acl[i]))
+                    {
+                        host_ok = 1;
+                        break;
+                    }
+                }
+            }
         }
+    }
+
+    if (require_granted && !has_require_host && !require_local) {
+        host_ok = 1;
     }
 
     return (compat_ok && host_ok) ? NGX_OK : NGX_HTTP_FORBIDDEN;
@@ -459,7 +607,7 @@ hta_check_access(ngx_http_request_t *r, hta_parsed_t *h)
 
     return hta_eval_acl(r, h->acl, h->nacl, h->access_order,
         h->has_acl, h->has_require_host, h->require_local, h->require_failed,
-        h->require_granted, h->require_denied);
+        h->require_granted, h->require_denied, h->require_all);
 }
 
 
@@ -471,8 +619,9 @@ hta_check_access(ngx_http_request_t *r, hta_parsed_t *h)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static const u_char *
-hta_passwd_get(ngx_http_hta_main_conf_t *mc, ngx_str_t *path,
-    size_t *out_len, ngx_log_t *log)
+hta_passwd_get(ngx_http_request_t *r, ngx_http_hta_main_conf_t *mc,
+    ngx_str_t *path, size_t *out_len, ngx_log_t *log,
+    ngx_uint_t owner_check, uid_t expected_uid)
 {
     ngx_uint_t       i, slot;
     ngx_file_info_t  fi;
@@ -483,6 +632,9 @@ hta_passwd_get(ngx_http_hta_main_conf_t *mc, ngx_str_t *path,
     hta_passwd_entry_t *e;
 
     if (path->len == 0 || path->len >= HTA_MAX_PATH) return NULL;
+
+    /* AuthUserFile/AuthGroupFile must stay under the site's document root. */
+    if (r != NULL && !hta_path_inside_root(r, path)) return NULL;
 
     /* stat the file to get current mtime */
     if (ngx_file_info(path->data, &fi) != 0)  return NULL;
@@ -495,27 +647,42 @@ hta_passwd_get(ngx_http_hta_main_conf_t *mc, ngx_str_t *path,
         if (mc->passwd[i].pathlen == path->len
             && ngx_memcmp(mc->passwd[i].path, path->data, path->len) == 0)
         {
-            if (mc->passwd[i].mtime == mtime && mc->passwd[i].content) {
+            if (mc->passwd[i].mtime == mtime && mc->passwd[i].content
+                && (!owner_check
+                    || (mc->passwd[i].owner_valid
+                        && mc->passwd[i].owner_uid == expected_uid)))
+            {
                 /* cache hit */
                 *out_len = mc->passwd[i].content_len;
                 return mc->passwd[i].content;
             }
             /* mtime changed - invalidate */
             if (mc->passwd[i].pool) {
+                mc->passwd_bytes -= mc->passwd[i].content_len
+                                    + sizeof(hta_passwd_entry_t);
                 ngx_destroy_pool(mc->passwd[i].pool);
-                mc->passwd[i].pool    = NULL;
-                mc->passwd[i].content = NULL;
+                mc->passwd[i].pool      = NULL;
+                mc->passwd[i].content   = NULL;
+                mc->passwd[i].content_len = 0;
             }
             slot = i;
             goto load;
         }
     }
 
-    /* not found - evict oldest if full */
-    if (mc->npasswd >= HTA_PASSWD_SLOTS) {
-        if (mc->passwd[0].pool) ngx_destroy_pool(mc->passwd[0].pool);
+    /* not found - evict oldest until slot and byte budgets fit */
+    while (mc->npasswd > 0
+           && (mc->npasswd >= HTA_PASSWD_SLOTS
+               || mc->passwd_bytes + (size_t) fsz + 256
+                  > HTA_PASSWD_MAX_BYTES))
+    {
+        if (mc->passwd[0].pool) {
+            mc->passwd_bytes -= mc->passwd[0].content_len
+                                + sizeof(hta_passwd_entry_t);
+            ngx_destroy_pool(mc->passwd[0].pool);
+        }
         ngx_memmove(&mc->passwd[0], &mc->passwd[1],
-                     sizeof(hta_passwd_entry_t) * (HTA_PASSWD_SLOTS - 1));
+                     sizeof(hta_passwd_entry_t) * (mc->npasswd - 1));
         mc->npasswd--;
     }
     slot = mc->npasswd;
@@ -528,9 +695,29 @@ hta_passwd_get(ngx_http_hta_main_conf_t *mc, ngx_str_t *path,
 load:
     e = &mc->passwd[slot];
 
-    /* read file into per-entry pool */
-    fd = ngx_open_file(path->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    /* read file into per-entry pool; never follow a symlink */
+    if (owner_check && !hta_file_owner_ok(path->data, log)) return NULL;
+
+    fd = open((char *) path->data, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd == NGX_INVALID_FILE) return NULL;
+
+    if (owner_check && !hta_fd_owner_ok(fd, path->data, log)) {
+        ngx_close_file(fd);
+        return NULL;
+    }
+
+    if (owner_check && !hta_fd_uid_ok(fd, expected_uid, path->data, log)) {
+        ngx_close_file(fd);
+        return NULL;
+    }
+
+    {
+        struct stat pst;
+        if (fstat(fd, &pst) == 0) {
+            e->owner_uid   = pst.st_uid;
+            e->owner_valid = 1;
+        }
+    }
 
     e->pool = ngx_create_pool((size_t)fsz + 256, log);
     if (e->pool == NULL) { ngx_close_file(fd); return NULL; }
@@ -554,6 +741,7 @@ load:
     e->content[nr] = '\0';
     e->content_len  = (size_t)nr;
     e->mtime        = mtime;
+    mc->passwd_bytes += e->content_len + sizeof(hta_passwd_entry_t);
 
     *out_len = e->content_len;
     return e->content;
@@ -593,37 +781,15 @@ hta_files_match(hta_files_block_t *fb, ngx_str_t *basename)
     if (basename->len == 0) return 0;
 
     if (fb->is_regex && fb->regex) {
-        return ngx_regex_exec(fb->regex, basename, NULL, 0) >= 0;
-    }
-
-    /* exact match */
-    if (fb->pattern.len == basename->len
-        && ngx_strncasecmp(fb->pattern.data, basename->data,
-                           basename->len) == 0)
-    {
-        return 1;
-    }
-
-    /* simple wildcard: ".ht*" or "*.ext" */
-    if (fb->pattern.len > 1 && fb->pattern.data[fb->pattern.len - 1] == '*') {
-        ngx_uint_t plen = fb->pattern.len - 1;
-        if (basename->len >= plen
-            && ngx_strncasecmp(basename->data, fb->pattern.data, plen) == 0)
-        {
-            return 1;
+        ngx_int_t rc = hta_regex_exec(fb->regex, basename, NULL, 0);
+        if (rc == HTA_REGEX_ERROR) {
+            return -1;
         }
-    }
-    if (fb->pattern.len > 1 && fb->pattern.data[0] == '*') {
-        ngx_uint_t slen = fb->pattern.len - 1;
-        if (basename->len >= slen
-            && ngx_strncasecmp(basename->data + basename->len - slen,
-                               fb->pattern.data + 1, slen) == 0)
-        {
-            return 1;
-        }
+        return rc >= 0;
     }
 
-    return 0;
+    return hta_wildcard_match(fb->pattern.data, fb->pattern.len,
+                              basename->data, basename->len);
 }
 
 
@@ -703,7 +869,9 @@ hta_check_files_access(ngx_http_request_t *r, hta_parsed_t *h)
         hta_files_block_t *fb = &h->files_blocks[i];
         ngx_int_t          rc;
 
-        if (!hta_files_match(fb, &basename)) continue;
+        rc = hta_files_match(fb, &basename);
+        if (rc == -1) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        if (!rc) continue;
 
         if (!fb->has_acl && !fb->has_require_host && !fb->require_local
             && !fb->require_denied && !fb->require_granted
@@ -712,7 +880,7 @@ hta_check_files_access(ngx_http_request_t *r, hta_parsed_t *h)
 
         rc = hta_eval_acl(r, fb->acl, fb->nacl, fb->access_order,
             fb->has_acl, fb->has_require_host, fb->require_local,
-            fb->require_failed, fb->require_granted, fb->require_denied);
+            fb->require_failed, fb->require_granted, fb->require_denied, 0);
         if (rc != NGX_OK) return rc;
     }
     return NGX_OK;
@@ -739,8 +907,11 @@ hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h)
         unsigned           block_sets_type;
         unsigned           eff_basic, eff_unsupported;
         unsigned           has_req;
+        ngx_int_t          mrc;
 
-        if (!hta_files_match(fb, &basename)) continue;
+        mrc = hta_files_match(fb, &basename);
+        if (mrc == -1) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        if (!mrc) continue;
 
         /* A <Files>/<FilesMatch> block inherits AuthType/AuthName/AuthUserFile/
          * AuthGroupFile from the enclosing scope (Apache behavior). Without this
@@ -758,28 +929,30 @@ hta_check_files_auth(ngx_http_request_t *r, hta_parsed_t *h)
         if (!has_req && !block_sets_type) continue;
 
         {
-        hta_parsed_t *tmp;
+        static hta_parsed_t tmp;
         ngx_uint_t    j;
         ngx_int_t     rc;
 
-        tmp = ngx_pcalloc(r->pool, sizeof(hta_parsed_t));
-        if (tmp == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        tmp->auth_basic = eff_basic;
-        tmp->auth_type_unsupported = eff_unsupported;
-        tmp->auth_valid_user = fb->auth_valid_user;
-        tmp->auth_name = fb->auth_name.len ? fb->auth_name : h->auth_name;
-        tmp->auth_user_file = fb->auth_user_file.len ? fb->auth_user_file
-                                                     : h->auth_user_file;
-        tmp->auth_group_file = fb->auth_group_file.len ? fb->auth_group_file
-                                                       : h->auth_group_file;
-        tmp->nauth_users = fb->nauth_users;
-        for (j = 0; j < fb->nauth_users && j < HTA_MAX_USERS; j++)
-            tmp->auth_users[j] = fb->auth_users[j];
-        tmp->nrequire_groups = fb->nrequire_groups;
-        for (j = 0; j < fb->nrequire_groups && j < HTA_MAX_GROUPS; j++)
-            tmp->require_groups[j] = fb->require_groups[j];
+        ngx_memzero(&tmp, sizeof(tmp));
 
-        rc = hta_check_auth(r, tmp);
+        tmp.owner_uid       = h->owner_uid;
+        tmp.owner_uid_valid = h->owner_uid_valid;
+        tmp.auth_basic = eff_basic;
+        tmp.auth_type_unsupported = eff_unsupported;
+        tmp.auth_valid_user = fb->auth_valid_user;
+        tmp.auth_name = fb->auth_name.len ? fb->auth_name : h->auth_name;
+        tmp.auth_user_file = fb->auth_user_file.len ? fb->auth_user_file
+                                                     : h->auth_user_file;
+        tmp.auth_group_file = fb->auth_group_file.len ? fb->auth_group_file
+                                                       : h->auth_group_file;
+        tmp.nauth_users = fb->nauth_users;
+        for (j = 0; j < fb->nauth_users && j < HTA_MAX_USERS; j++)
+            tmp.auth_users[j] = fb->auth_users[j];
+        tmp.nrequire_groups = fb->nrequire_groups;
+        for (j = 0; j < fb->nrequire_groups && j < HTA_MAX_GROUPS; j++)
+            tmp.require_groups[j] = fb->require_groups[j];
+
+        rc = hta_check_auth(r, &tmp);
         if (rc != NGX_OK) return rc;
         }
     }
@@ -834,7 +1007,7 @@ hta_check_limit_access(ngx_http_request_t *r, hta_parsed_t *h)
 
         rc = hta_eval_acl(r, lb->acl, lb->nacl, lb->access_order,
             lb->has_acl, lb->has_require_host, lb->require_local,
-            lb->require_failed, lb->require_granted, lb->require_denied);
+            lb->require_failed, lb->require_granted, lb->require_denied, 0);
         if (rc != NGX_OK) return rc;
     }
     return NGX_OK;
@@ -854,7 +1027,7 @@ hta_check_limit_auth(ngx_http_request_t *r, hta_parsed_t *h)
 
     for (i = 0; i < h->nlimit_blocks; i++) {
         hta_limit_block_t *lb = &h->limit_blocks[i];
-        hta_parsed_t      *tmp;
+        static hta_parsed_t tmp;
         ngx_uint_t         j;
         ngx_int_t          rc;
         unsigned           block_sets_type, eff_basic, eff_unsupported, has_req;
@@ -872,24 +1045,26 @@ hta_check_limit_auth(ngx_http_request_t *r, hta_parsed_t *h)
 
         if (!has_req && !block_sets_type) continue;
 
-        tmp = ngx_pcalloc(r->pool, sizeof(hta_parsed_t));
-        if (tmp == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        tmp->auth_basic = eff_basic;
-        tmp->auth_type_unsupported = eff_unsupported;
-        tmp->auth_valid_user = lb->auth_valid_user;
-        tmp->auth_name = lb->auth_name.len ? lb->auth_name : h->auth_name;
-        tmp->auth_user_file = lb->auth_user_file.len ? lb->auth_user_file
-                                                     : h->auth_user_file;
-        tmp->auth_group_file = lb->auth_group_file.len ? lb->auth_group_file
-                                                       : h->auth_group_file;
-        tmp->nauth_users = lb->nauth_users;
-        for (j = 0; j < lb->nauth_users && j < HTA_MAX_USERS; j++)
-            tmp->auth_users[j] = lb->auth_users[j];
-        tmp->nrequire_groups = lb->nrequire_groups;
-        for (j = 0; j < lb->nrequire_groups && j < HTA_MAX_GROUPS; j++)
-            tmp->require_groups[j] = lb->require_groups[j];
+        ngx_memzero(&tmp, sizeof(tmp));
 
-        rc = hta_check_auth(r, tmp);
+        tmp.owner_uid       = h->owner_uid;
+        tmp.owner_uid_valid = h->owner_uid_valid;
+        tmp.auth_basic = eff_basic;
+        tmp.auth_type_unsupported = eff_unsupported;
+        tmp.auth_valid_user = lb->auth_valid_user;
+        tmp.auth_name = lb->auth_name.len ? lb->auth_name : h->auth_name;
+        tmp.auth_user_file = lb->auth_user_file.len ? lb->auth_user_file
+                                                     : h->auth_user_file;
+        tmp.auth_group_file = lb->auth_group_file.len ? lb->auth_group_file
+                                                       : h->auth_group_file;
+        tmp.nauth_users = lb->nauth_users;
+        for (j = 0; j < lb->nauth_users && j < HTA_MAX_USERS; j++)
+            tmp.auth_users[j] = lb->auth_users[j];
+        tmp.nrequire_groups = lb->nrequire_groups;
+        for (j = 0; j < lb->nrequire_groups && j < HTA_MAX_GROUPS; j++)
+            tmp.require_groups[j] = lb->require_groups[j];
+
+        rc = hta_check_auth(r, &tmp);
         if (rc != NGX_OK) return rc;
     }
     return NGX_OK;
@@ -939,9 +1114,14 @@ hta_check_exec(ngx_http_request_t *r, hta_parsed_t *h)
      * blocks execution regardless of extension (the block targets those files) */
     for (i = 0; i < h->nfiles_blocks; i++) {
         hta_files_block_t *fb = &h->files_blocks[i];
-        if (fb->exec_disabled && hta_files_match(fb, &bn)) {
+        ngx_int_t mrc = hta_files_match(fb, &bn);
+
+        if (mrc == -1) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        if (fb->exec_disabled && mrc) {
             ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                "htaccess: script execution disabled for \"%V\"", &r->uri);
+                "htaccess: exec disabled for \"%V\"", &r->uri);
             return NGX_HTTP_FORBIDDEN;
         }
     }
@@ -960,10 +1140,13 @@ hta_check_exec(ngx_http_request_t *r, hta_parsed_t *h)
 ngx_int_t
 hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
 {
-    ngx_str_t  enc, dec;
-    u_char    *colon;
-    ngx_str_t  user, pass;
-    ngx_int_t  result;
+    ngx_str_t                enc, dec;
+    u_char                  *colon;
+    ngx_str_t                user, pass;
+    ngx_int_t                result;
+    ngx_http_hta_loc_conf_t *lcf;
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_htaccess_module);
 
     /* AuthType set to an unsupported scheme (Digest, etc.): fail closed rather
      * than silently serving the protected resource (Apache returns 500). */
@@ -1076,8 +1259,11 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
         u_char                   *line, *fend;
 
         mc = ngx_http_get_module_main_conf(r, ngx_http_htaccess_module);
-        fbuf = hta_passwd_get(mc, &h->auth_user_file, &fsz,
-                               r->connection->log);
+        fbuf = hta_passwd_get(r, mc, &h->auth_user_file, &fsz,
+                               r->connection->log,
+                               lcf ? lcf->owner_check : 1,
+                               h->owner_uid_valid ? h->owner_uid
+                                                  : (uid_t) -1);
         if (fbuf == NULL) {
             result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
         }
@@ -1162,8 +1348,11 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
             unsigned                  in_group = 0;
 
             mc = ngx_http_get_module_main_conf(r, ngx_http_htaccess_module);
-            gbuf = hta_passwd_get(mc, &h->auth_group_file, &gsz,
-                                   r->connection->log);
+            gbuf = hta_passwd_get(r, mc, &h->auth_group_file, &gsz,
+                                   r->connection->log,
+                                   lcf ? lcf->owner_check : 1,
+                                   h->owner_uid_valid ? h->owner_uid
+                                                      : (uid_t) -1);
             if (gbuf == NULL) {
                 result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
             }

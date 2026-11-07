@@ -1,0 +1,3 @@
+AuthType Basic
+AuthName "Inherited Realm"
+AuthUserFile __HTDOCS_ROOT__/auth/.htpasswd

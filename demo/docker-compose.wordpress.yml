@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: demo/Dockerfile.wordpress
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
     volumes:
       - ./www/wordpress:/var/www/html
     depends_on:
@@ -22,14 +22,14 @@ services:
   mysql:
     image: mysql:8.0
     environment:
-      MYSQL_ROOT_PASSWORD: rootpass
-      MYSQL_DATABASE: wordpress
-      MYSQL_USER: wp
-      MYSQL_PASSWORD: wppass
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?create demo/.env via demo.sh}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wordpress}
+      MYSQL_USER: ${MYSQL_USER:-wp}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?create demo/.env via demo.sh}
     volumes:
       - wp_mysql_data:/var/lib/mysql
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
 
 volumes:
   wp_mysql_data:

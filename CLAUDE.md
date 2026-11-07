@@ -54,8 +54,36 @@ cd demo && ./demo.sh                                          # interactive demo
 - Direct access to any `.ht*` basename -> 403 (incl. backups like `.htpasswd.bak`)
 - File-size cap: 1 MB on `.htaccess` / `.htpasswd` / `.htgroup`
 - `Require group` inside `<Files>` / `<Limit>` IS propagated (bypass class)
-- CR/LF stripped from `Header` and `RequestHeader` values at parse time
+- CR/LF stripped from `Header` and `RequestHeader` values at parse time;
+  runtime-expanded redirect/header values are checked for CR/LF/NUL too
 - All header lookups use `ngx_strncasecmp` (case-insensitive)
+- `htaccess_strict` defaults to **on**: parse errors, invalid regexes, unknown
+  directives/blocks, unreadable/oversized files and malformed tags fail closed
+- `O_NOFOLLOW` + `htaccess_owner_check on` (default) for `.ht*` and auth files;
+  `realpath()` confinement for `AuthUserFile`, `AuthGroupFile` and file tests.
+  Auth files must match the requesting `.htaccess` owner (cross-tenant block).
+  Parse warnings never log file content.
+- `root`/`alias` with variables or regex aliases fail closed; unsupported
+  `<If>` / `<IfVersion>` blocks fail closed (only `<IfModule>` is evaluated)
+- Cache is byte-bounded, paths are inline, inotify watches are removed on
+  invalidation, and changes are visible to the next request
+- `php_admin_*` is ignored unless `htaccess_allow_php_admin on`; proxy header
+  forgery is refused unless `htaccess_allow_proxy_headers on`
+- Dangerous `php_value` settings (`auto_prepend_file`, `open_basedir`,
+  `session.save_path`, ...) are dropped unless `htaccess_allow_dangerous_php on`
+- `Header unset` of security headers is refused unless
+  `htaccess_allow_security_unset on`; response framing headers are always
+  protected
+- `ExpiresActive` is merged root-to-leaf and emitted once, so child `Off`
+  removes a parent `Expires` instead of duplicating it
+- Request paths escaping the document root via symlinks are denied
+  (`htaccess_symlink_check on`); `Options -FollowSymLinks` also rejects
+  symlinked components
+- AuthType/AuthName/AuthUserFile/AuthGroupFile inherit across `.htaccess`
+  files; a child may contain only `Require valid-user`
+- ErrorDocument status/precedence: deepest `.htaccess` wins and internal
+  error pages keep the original 4xx/5xx status. Static content-phase 404s are
+  not intercepted (documented limitation).
 
 ## Common pitfalls
 

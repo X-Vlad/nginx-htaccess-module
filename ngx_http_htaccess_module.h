@@ -39,6 +39,11 @@
 #define HTA_PASSWD_SLOTS      256
 #define HTA_INOTIFY_BUF       4096
 #define HTA_MAX_CAPTURES      30
+#define HTA_MAX_TOKENS        64
+#define HTA_MAX_REGEX_LEN     4096
+#define HTA_REGEX_MAX_BYTES   (8 * 1024 * 1024)
+#define HTA_CACHE_MAX_BYTES   (64 * 1024 * 1024)
+#define HTA_PASSWD_MAX_BYTES  (32 * 1024 * 1024)
 
 /* RewriteRule flags */
 #define HTA_F_LAST            0x0001
@@ -54,6 +59,7 @@
 #define HTA_F_CHAIN           0x0400
 #define HTA_F_PT              0x0800
 #define HTA_F_END             0x1000
+#define HTA_F_NOT             0x2000
 
 /* RewriteCond flags */
 #define HTA_CF_NOCASE         0x0001
@@ -315,6 +321,7 @@ typedef struct {
 
     /* Expires */
     unsigned          expires_active:1;
+    unsigned          expires_active_set:1; /* ExpiresActive directive seen */
     hta_expires_t     expires[HTA_MAX_EXPIRES];
     ngx_uint_t        nexpires;
     ngx_int_t         expires_default;
@@ -352,13 +359,36 @@ typedef struct {
      * block script (PHP) execution in this scope */
     unsigned          exec_disabled:1;
 
+    /* directory of this .htaccess relative to the document root, with
+     * trailing '/', e.g. "blog/" for /blog/.htaccess.  Used to match
+     * RewriteRule patterns in Apache per-directory context. */
+    ngx_str_t         dir_rel;
+
     /* meta */
     time_t            mtime;
+    size_t            mem_size;     /* approximate total pool footprint */
+    size_t            regex_bytes;  /* compiled PCRE budget */
     ngx_pool_t       *pool;
+    /* owner of the directory containing this .htaccess.  AuthUserFile /
+     * AuthGroupFile must belong to the same tenant, otherwise one customer
+     * can authenticate against another customer's password file. */
+    uid_t             owner_uid;
+    unsigned          owner_uid_valid:1;
+
+    /* fail-closed state: a file that exists but cannot be parsed must never
+     * silently turn into "no rules" */
+    unsigned          invalid:1;
+    /* <RequireAll> / <RequireAny> scope flags */
+    unsigned          require_all:1;
+    unsigned          require_any:1;
 } hta_parsed_t;
 
 typedef struct {
-    u_char           *path;         /* allocated from mc->path_pool */
+    /*
+     * Store paths inline.  The old path_pool was never reclaimed on cache
+     * eviction and grew without bound on every distinct path served.
+     */
+    u_char            path[HTA_MAX_PATH];
     ngx_uint_t        pathlen;
     uint32_t          path_hash;    /* FNV-1a for fast comparison */
     hta_parsed_t     *parsed;
@@ -371,6 +401,12 @@ typedef struct {
     ngx_str_t         filename;
     ngx_flag_t        strict;       /* fail closed (500) on unknown directives */
     ngx_flag_t        trust_proxy;  /* honor X-Forwarded-Proto for SSLRequireSSL */
+    ngx_flag_t        owner_check;  /* require .ht* owner == parent dir owner */
+    ngx_flag_t        allow_php_admin; /* accept php_admin_* from .htaccess */
+    ngx_flag_t        allow_proxy_headers; /* let .htaccess set X-Forwarded-* */
+    ngx_flag_t        allow_dangerous_php; /* allow auto_prepend_file etc. */
+    ngx_flag_t        allow_security_unset; /* allow unsetting security hdrs */
+    ngx_flag_t        symlink_check; /* block request paths escaping root */
 } ngx_http_hta_loc_conf_t;
 
 typedef struct {
@@ -379,28 +415,33 @@ typedef struct {
     u_char     *content;       /* NUL-terminated, owned by pool */
     size_t      content_len;
     time_t      mtime;
+    uid_t       owner_uid;
+    unsigned    owner_valid:1;
     ngx_pool_t *pool;
 } hta_passwd_entry_t;
 
 typedef struct {
     hta_cache_t        cache[HTA_CACHE_SLOTS];
     ngx_uint_t         ncache;
+    size_t             cache_bytes;
     int                inotify_fd;
-    ngx_uint_t         poll_counter; /* amortize inotify read() syscall */
-    ngx_pool_t        *path_pool;   /* owns all path strings in cache[] */
     hta_passwd_entry_t passwd[HTA_PASSWD_SLOTS];
     ngx_uint_t         npasswd;
+    size_t             passwd_bytes;
 } ngx_http_hta_main_conf_t;
 
 typedef struct {
     ngx_str_t  files[HTA_MAX_DEPTH];
     ngx_uint_t count;
+    unsigned   error:1;   /* path truncated / depth cap hit: fail closed */
 } hta_file_list_t;
 
 typedef struct {
     ngx_str_t       uri;        /* URI at collection time */
     hta_file_list_t files;
     unsigned        collected:1;
+    ngx_str_t       root_real;  /* cached realpath(clcf->root) */
+    unsigned        root_real_set:1;
 } hta_req_ctx_t;
 
 
@@ -423,9 +464,30 @@ hta_file_list_t *hta_get_files(ngx_http_request_t *r, ngx_str_t *root,
 
 /* parser.c */
 hta_parsed_t *hta_parse_file(ngx_pool_t *pool, u_char *filepath,
+    ngx_log_t *log, ngx_uint_t owner_check);
+ngx_int_t hta_file_owner_ok(u_char *path, ngx_log_t *log);
+ngx_int_t hta_fd_owner_ok(ngx_fd_t fd, u_char *path, ngx_log_t *log);
+ngx_int_t hta_fd_uid_ok(ngx_fd_t fd, uid_t expected_uid, u_char *path,
     ngx_log_t *log);
+ngx_int_t hta_request_path_inside_root(ngx_http_request_t *r);
+ngx_int_t hta_path_has_symlink(ngx_http_request_t *r);
+ngx_int_t hta_location_supported(ngx_http_core_loc_conf_t *clcf);
+ngx_int_t hta_pstrdup(ngx_http_request_t *r, ngx_str_t *dst,
+    const ngx_str_t *src);
+ngx_int_t hta_path_inside_root(ngx_http_request_t *r, ngx_str_t *path);
+ngx_int_t hta_wildcard_match(u_char *pattern, size_t plen, u_char *name,
+    size_t nlen);
 ngx_uint_t hta_tokenize(u_char *line, ngx_uint_t len, u_char **args,
     ngx_uint_t maxargs);
+
+/*
+ * Match a customer-supplied regex with PCRE2 match/depth limits.  The
+ * module's patterns are untrusted input in shared hosting; nginx's
+ * ngx_regex_exec() uses the default, effectively unbounded, match context.
+ */
+#define HTA_REGEX_ERROR  (-3)
+ngx_int_t hta_regex_exec(ngx_regex_t *re, ngx_str_t *s, int *captures,
+    ngx_uint_t size);
 
 /* rewrite.c */
 ngx_int_t hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src,
@@ -434,9 +496,11 @@ ngx_int_t hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_apply_dirindex(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_apply_fallback(ngx_http_request_t *r, ngx_str_t *fallback);
-void hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h);
-ngx_int_t hta_check_errdoc(ngx_http_request_t *r, hta_parsed_t *h,
-    ngx_int_t status);
+ngx_int_t hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h);
+ngx_int_t hta_check_errdoc(ngx_http_request_t *r, hta_errdoc_t *errdocs,
+    ngx_uint_t nerrdocs, ngx_int_t status);
+ngx_int_t hta_protected_security_header(ngx_str_t *name);
+ngx_int_t hta_dangerous_php_value(ngx_str_t *name);
 
 /* access.c */
 ngx_int_t hta_check_access(ngx_http_request_t *r, hta_parsed_t *h);

@@ -73,8 +73,8 @@ Absolute throughput numbers depend heavily on the host environment (kernel, CPU,
 |-----------|--------|-------|
 | `DirectoryIndex file1 file2 ...` | Full | Multiple index files with filesystem check |
 | `FallbackResource /index.php` | Full | Front controller when the request maps to no existing file (`disabled` clears it) |
-| `ErrorDocument code response` | Partial | URL path / external URL; text-message form returns the status only. Fires on access-phase denials |
-| `Options -Indexes ...` | Full | `-Indexes` is enforced (403 for an index-less directory); FollowSymLinks/MultiViews/All/None parsed |
+| `ErrorDocument code response` | Partial | URL path / external URL, deepest `.htaccess` wins, internal page keeps the original status; text-message form returns the status only. Fires on module/access-phase errors; a static 404 produced by the content phase is not intercepted |
+| `Options -Indexes ...` | Partial | `-Indexes` and `-FollowSymLinks` enforced; `MultiViews`/`All`/`None` parsed. Symlinks resolving outside the document root are always denied |
 | `ForceType mime/type` | Full | Also within `<Files>` blocks |
 | `DefaultType mime/type` | Full | Fallback content type |
 | `AddType mime/type .ext1 .ext2` | Full | Multiple extensions per directive |
@@ -165,7 +165,7 @@ constraint, not Apache. The values become visible to upstream via
 ### PHP Settings (forwarded to PHP-FPM)
 | Directive | Status | Notes |
 |-----------|--------|-------|
-| `php_value name value` | Full | Collected into `$htaccess_php_value` |
+| `php_value name value` | Full | Collected into `$htaccess_php_value`; dangerous settings are filtered (see Security) |
 | `php_admin_value name value` | Full | Collected into `$htaccess_php_admin_value` |
 | `php_flag name on/off` | Full | Collected into `$htaccess_php_value`; `php_flag engine off` also blocks script execution |
 | `php_admin_flag name on/off` | Full | Collected into `$htaccess_php_admin_value` |
@@ -193,10 +193,10 @@ The variables are empty strings when no `php_*` directives are in scope, which i
 | `<LimitExcept METHOD ...>` | Full | Contained directives apply to all methods except listed |
 | `<RequireNone>` | Full | Inner `Require ip/host/env` invert to Deny (ban list) |
 | `<RequireAll>` / `<RequireAny>` | Partial | Inner requirements are flattened; the common `valid-user` + `ip` mix works via `Satisfy`, but multi-host AND/OR grouping is not distinguished |
-| `<Directory>` / `<Location>` | Skip | Silently skipped (not per-dir context) |
-| `<If>` / `<ElseIf>` / `<Else>` | Skip | Apache expression blocks not evaluated (contents skipped) |
+| `<Directory>` / `<Location>` | Fail closed | Not valid in `.htaccess`; the file is rejected |
+| `<If>` / `<ElseIf>` / `<Else>` | Fail closed | Apache expressions are not evaluated; file is rejected |
 
-`<Limit>` recognizes GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE, PROPFIND, PROPPATCH, COPY, MOVE, MKCOL, LOCK, UNLOCK. Nesting `<Limit>` inside `<Files>` is not supported (the inner block is silently skipped).
+`<Limit>` recognizes GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE, PROPFIND, PROPPATCH, COPY, MOVE, MKCOL, LOCK, UNLOCK. Nesting `<Limit>` inside `<Files>` or `<Files>` inside `<Limit>` is rejected (fails closed).
 
 ### Script-execution kill-switch
 `SetHandler none` / `SetHandler default-handler`, `RemoveHandler .php`, and
@@ -240,7 +240,8 @@ nginx variable lookup.
 
 - Direct access to any `.ht*` basename is blocked with 403 (covers backups/editor swap files like `.htpasswd.bak`, `.htaccess~`), not just the four canonical names.
 - Standalone `Require ip`/`Require host` denies non-matching clients (Apache 2.4 authz), rather than degrading to allow-all under the default `Order deny,allow`.
-- `AuthType Digest` or any unsupported AuthType fails closed (500), and a `Require` with no usable AuthType returns 500 - never silently public. Per-file `Require` in `<Files>`/`<Limit>` inherits the enclosing AuthType and is enforced.
+- `AuthType`/`AuthName`/`AuthUserFile`/`AuthGroupFile` are inherited from parent `.htaccess` files, so a child may contain only `Require valid-user`. A password/group file must be owned by the same tenant as the `.htaccess` (otherwise 500), on top of the path confinement.
+- `AuthType Digest` or any unsupported AuthType fails closed (500), and a `Require` with no usable AuthType never silently grants access. Per-file `Require` in `<Files>`/`<Limit>` inherits the enclosing AuthType.
 - `<Limit GET>` also constrains HEAD; `SSLRequireSSL` trusts `X-Forwarded-Proto` only with `htaccess_trust_proxy on`.
 - File paths are validated within document root boundaries (path traversal prevention) on `AuthUserFile`, `AuthGroupFile`, and all file-test conditions.
 - `.htaccess`, `.htpasswd`, and `.htgroup` files larger than 1MB are rejected.
@@ -253,6 +254,21 @@ nginx variable lookup.
 - `Header` / `RequestHeader` values have CR/LF stripped at parse time to prevent response or upstream-request splitting.
 - `php_value` / `php_admin_value` values have CR / LF / `"` / NUL replaced with spaces before being concatenated into the `PHP_VALUE` fastcgi param.
 - All response/request-header lookups are case-insensitive (`ngx_strncasecmp`), so client variations like `x-forwarded-proto` match the same as `X-Forwarded-Proto`.
+- `htaccess_strict` now defaults to **on**: an unknown directive, invalid regex, unreadable/oversized `.htaccess`, malformed `<Files>` tag, or unsupported block fails closed (500) instead of silently dropping protection.
+- Security-sensitive files are opened with `O_NOFOLLOW`; `htaccess_owner_check on` (default) additionally requires the file owner to match the containing directory. Symlinked or foreign-owned `.htaccess`, `.htpasswd`, `.htgroup`, and `AuthUserFile`/`AuthGroupFile` targets are rejected. Parse warnings no longer include file content.
+- `AuthUserFile`, `AuthGroupFile`, and `RewriteCond -f/-d/-l/-e/-s` paths are confined to the document root with `realpath()`; outside paths behave as missing. Auth files are additionally required to belong to the same Unix owner as the requesting `.htaccess`, blocking cross-tenant password-file use.
+- Request paths whose `realpath()` escapes the document root through a symlink are denied (`htaccess_symlink_check on`, default). `Options -FollowSymLinks` additionally rejects any symlink component below the root.
+- All access/auth/.ht* checks also run for subrequests (SSI includes, `auth_request`), not only the main request.
+- `root`/`alias` values containing nginx variables or regex aliases fail closed (500); they are not silently treated as "no `.htaccess`".
+- Dynamic redirect/header values containing CR, LF, or NUL are rejected; response framing headers (`Content-Length`, `Transfer-Encoding`, `Connection`, ...) cannot be set/removed from `.htaccess`; request proxy headers (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, ...) can only be forged with `htaccess_allow_proxy_headers on`.
+- Cache memory is bounded (`HTA_CACHE_MAX_BYTES`/`HTA_PASSWD_MAX_BYTES`), paths are stored inline (no unbounded `path_pool`), inotify watches are removed on invalidation/eviction, and changes are detected on the next request (no 64-request window).
+- Compiled customer regexes have pattern-size, compiled-size, match-limit and depth-limit budgets. Tokenization is single-pass and linear.
+- `php_admin_value`/`php_admin_flag` from `.htaccess` are ignored by default; set `htaccess_allow_php_admin on` only for single-tenant / trusted setups. `php_value` settings that can escape the site or leak across tenants (`auto_prepend_file`, `auto_append_file`, `open_basedir`, `disable_functions`, `extension`, `include_path`, `error_log`, `session.save_path`, `upload_tmp_dir`, `allow_url_include`, ...) are dropped unless `htaccess_allow_dangerous_php on`. PHP-FPM pools that consume `PHP_VALUE` should still be dedicated per customer because PHP settings can persist in a worker.
+- `Header unset` cannot remove common security headers (`Strict-Transport-Security`, CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, CORP/COOP/COEP, ...) set by a parent scope unless `htaccess_allow_security_unset on`; response framing headers (`Content-Length`, `Transfer-Encoding`, `Connection`, ...) can never be set or removed.
+- `ExpiresActive` state is merged root-to-leaf and the header is emitted once, so `ExpiresActive Off` in a child removes a parent-generated `Expires`/`Cache-Control` instead of leaving a stale value or duplicate.
+- `<Limit>` inside `<Files>`, nested `<Limit>/<Files>`, `<If>`/`<IfVersion>` and unknown blocks now fail closed rather than being silently skipped. (`<IfModule>` and `<IfModule !mod>` are still supported.)
+- Path/depth/candidate/header/auth-list caps fail closed (500) instead of silently dropping the overflowing security directives.
+- Cross-tenant regression coverage: `t/23-hardening.t.sh` creates two Unix owners and verifies symlinked directory escapes, hardlinked/symlinked `.htaccess`, and an `AuthUserFile` pointing at the other tenant are all rejected.
 
 ## Installation
 
@@ -380,7 +396,13 @@ http {
 |-----------|---------|---------|-------------|
 | `htaccess` | http, server, location | `off` | Enable/disable .htaccess processing |
 | `htaccess_filename` | http, server, location | `.htaccess` | Name of the htaccess file to look for |
-| `htaccess_strict` | http, server, location | `off` | Fail closed (500) when a `.htaccess` uses an unrecognized directive, instead of silently ignoring it |
+| `htaccess_strict` | http, server, location | `on` | Fail closed (500) when a `.htaccess` uses an unrecognized directive, has a parse error, or hits a parser/candidate limit |
+| `htaccess_owner_check` | http, server, location | `on` | Require `.ht*` and auth files to be owned by the containing directory / requesting tenant |
+| `htaccess_symlink_check` | http, server, location | `on` | Deny request paths whose realpath escapes the document root through a symlink |
+| `htaccess_allow_php_admin` | http, server, location | `off` | Allow `php_admin_*` from `.htaccess` (trusted single-tenant only) |
+| `htaccess_allow_dangerous_php` | http, server, location | `off` | Allow `auto_prepend_file`, `open_basedir`, etc. from `php_value` |
+| `htaccess_allow_proxy_headers` | http, server, location | `off` | Allow `RequestHeader` to forge `X-Forwarded-*`/`Forwarded`/`X-Real-IP` |
+| `htaccess_allow_security_unset` | http, server, location | `off` | Allow `Header unset` of security headers set by a parent scope |
 | `htaccess_trust_proxy` | http, server, location | `off` | Trust `X-Forwarded-Proto` for `SSLRequireSSL` (enable only when nginx sits behind a TLS-terminating proxy that overwrites the header) |
 
 ## Architecture

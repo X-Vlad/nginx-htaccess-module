@@ -2,8 +2,10 @@
 .*
 !.github/
 !.gitignore
+!.gitattributes
 !.htaccess
 !.htpasswd
+!.env.example
 
 # Build artifacts
 *.o

@@ -1,6 +1,7 @@
 FROM ubuntu:24.04
 
 ARG NGINX_VERSION=1.28.2
+ARG NGINX_SHA256=20e5e0f2c917acfb51120eec2fba9a4ba4e1e10fd28465067cc87a7d81a829a3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -17,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Download and extract nginx source
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
+    && echo "${NGINX_SHA256}  nginx-${NGINX_VERSION}.tar.gz" | sha256sum -c - \
     && tar xzf nginx-${NGINX_VERSION}.tar.gz \
     && rm nginx-${NGINX_VERSION}.tar.gz
 
@@ -63,7 +65,8 @@ RUN HTDOCS=/tests/t/htdocs \
                 "$HTDOCS/auth-apr1/.htaccess" \
                 "$HTDOCS/groups/.htaccess" \
                 "$HTDOCS/sec/inherit/.htaccess" \
-                "$HTDOCS/sec/satisfy-block/.htaccess"; do \
+                "$HTDOCS/sec/satisfy-block/.htaccess" \
+                "$HTDOCS/inherit-auth/.htaccess"; do \
         [ -f "$f" ] && sed -i "s|__HTDOCS_ROOT__|${HTDOCS}|g" "$f"; \
     done \
     && chmod +x /tests/t/run_tests.sh /tests/t/helpers.sh /tests/t/*.t.sh

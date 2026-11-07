@@ -1,6 +1,7 @@
 FROM ubuntu:24.04
 
 ARG NGINX_VERSION=1.28.2
+ARG NGINX_SHA256=20e5e0f2c917acfb51120eec2fba9a4ba4e1e10fd28465067cc87a7d81a829a3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -14,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Download and extract nginx source
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
+    && echo "${NGINX_SHA256}  nginx-${NGINX_VERSION}.tar.gz" | sha256sum -c - \
     && tar xzf nginx-${NGINX_VERSION}.tar.gz \
     && rm nginx-${NGINX_VERSION}.tar.gz
 
@@ -95,6 +97,7 @@ http {
 
         # Static files - caching & direct serve
         location ~* ^.+\.(jpg|jpeg|gif|png|webp|svg|ico|js|css|mp3|ogg|mpe?g|avi|zip|gz|bz2?|rar|swf|woff|woff2|ttf|eot)$ {
+            htaccess on;
             expires 365d;
             access_log off;
             add_header Cache-Control "public, immutable";
@@ -108,6 +111,7 @@ http {
 
         # PHP-FPM handler
         location ~ \.php$ {
+            htaccess on;
             fastcgi_pass php:9000;
             fastcgi_index index.php;
             fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
@@ -119,7 +123,7 @@ http {
 EOF
 
 # Copy demo site into image (avoids Docker volume 9P slowness on Windows)
-COPY demo/www/index.php demo/www/phpinfo.php demo/www/.htaccess /var/www/html/
+COPY demo/www/index.php demo/www/.htaccess /var/www/html/
 
 EXPOSE 80
 

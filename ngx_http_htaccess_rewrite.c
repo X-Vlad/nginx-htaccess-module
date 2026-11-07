@@ -7,11 +7,119 @@
 
 #include "ngx_http_htaccess_module.h"
 #include <sys/stat.h>
+#include <limits.h>
+#include <stdlib.h>
 
 
 /* defined later in this file - used by %{HTTP:Header} expansion */
 static ngx_table_elt_t *hta_find_req_header(ngx_http_request_t *r,
     ngx_str_t *name);
+static ngx_int_t hta_internal_redirect(ngx_http_request_t *r,
+    ngx_str_t *uri, ngx_str_t *args);
+
+/* Untrusted values must never put CR/LF/NUL into a header or internal URI. */
+static ngx_int_t
+hta_value_has_crlf(ngx_str_t *s)
+{
+    size_t i;
+    for (i = 0; i < s->len; i++) {
+        if (s->data[i] == '\r' || s->data[i] == '\n' || s->data[i] == '\0') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void
+hta_value_sanitize(ngx_str_t *s)
+{
+    size_t i;
+    for (i = 0; i < s->len; i++) {
+        if (s->data[i] == '\r' || s->data[i] == '\n' || s->data[i] == '\0') {
+            s->data[i] = ' ';
+        }
+    }
+}
+
+static ngx_int_t
+hta_value_contains(ngx_str_t *hay, ngx_str_t *needle)
+{
+    size_t i;
+
+    if (needle->len == 0) return 1;
+    if (hay->len < needle->len) return 0;
+
+    for (i = 0; i + needle->len <= hay->len; i++) {
+        if (ngx_memcmp(hay->data + i, needle->data, needle->len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+ngx_int_t
+hta_path_inside_root(ngx_http_request_t *r, ngx_str_t *path)
+{
+    ngx_http_core_loc_conf_t *clcf;
+    char                      resolved[PATH_MAX];
+    char                      root[PATH_MAX];
+    u_char                    full[HTA_MAX_PATH];
+    size_t                    rlen, n;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf == NULL || clcf->root.len == 0 || path->len == 0
+        || path->len + clcf->root.len + 2 >= sizeof(full))
+    {
+        return 0;
+    }
+
+    if (realpath((char *) clcf->root.data, root) == NULL) {
+        return 0;
+    }
+    rlen = ngx_strlen(root);
+
+    /*
+     * Keep file tests inside the document root.  Without this, a customer
+     * can use `RewriteCond /%1 -f` as an existence oracle for arbitrary
+     * paths the nginx worker can traverse.
+     */
+    if (path->data[0] == '/') {
+        ngx_memcpy(full, path->data, path->len);
+        full[path->len] = '\0';
+    } else {
+        (void) ngx_snprintf(full, sizeof(full), "%s/%V", root, path);
+    }
+
+    if (realpath((char *) full, resolved) == NULL) {
+        return 0;
+    }
+
+    n = ngx_strlen(resolved);
+    if (rlen == 1 && root[0] == '/') {
+        return 1;
+    }
+    if (n < rlen || ngx_memcmp(resolved, root, rlen) != 0) {
+        return 0;
+    }
+    return (n == rlen || resolved[rlen] == '/');
+}
+
+static ngx_int_t
+hta_uri_has_dotdot(ngx_str_t *s)
+{
+    u_char *p = s->data, *end = s->data + s->len;
+
+    while (p < end && *p != '?') {
+        if (p + 1 < end && p[0] == '.' && p[1] == '.'
+            && (p == s->data || p[-1] == '/')
+            && (p + 2 == end || p[2] == '/' || p[2] == '?'))
+        {
+            return 1;
+        }
+        p++;
+    }
+    return 0;
+}
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -92,7 +200,18 @@ hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst)
                         val.data = NULL;  /* unknown TIME_* -> empty */
                 }
             } else if (vlen == 11 && ngx_strncasecmp(vs, (u_char *)"REQUEST_URI", 11) == 0) {
-                val = r->uri;
+                /*
+                 * Apache REQUEST_URI is the original request URI, including
+                 * the query string; r->uri is the current, possibly
+                 * rewritten path and must not be used for security gates.
+                 */
+                if (!r->internal && r->unparsed_uri.len > 0) {
+                    val = r->unparsed_uri;
+                } else {
+                    /* After an internal redirect the original URI would make
+                     * a REQUEST_URI-gated catch-all re-fire forever. */
+                    val = r->uri;
+                }
             } else if (vlen == 16 && ngx_strncasecmp(vs, (u_char *)"REQUEST_FILENAME", 16) == 0) {
                 /* Filesystem path of the request. map_uri_to_path is alias-aware
                  * (matches the alias-fixed .htaccess collection); the old
@@ -150,12 +269,42 @@ hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst)
                     val.len = ngx_snprintf(val.data, 8, "%ui", port) - val.data;
                 }
             } else if (vlen == 5 && ngx_strncasecmp(vs, (u_char *)"HTTPS", 5) == 0) {
+                ngx_http_hta_loc_conf_t *hlcf;
+                unsigned                 is_https = 0;
+
 #if (NGX_HTTP_SSL)
-                val.data = (u_char *)(r->connection->ssl ? "on" : "off");
-                val.len = r->connection->ssl ? 2 : 3;
-#else
-                ngx_str_set(&val, "off");
+                if (r->connection->ssl) is_https = 1;
 #endif
+                hlcf = ngx_http_get_module_loc_conf(r,
+                                                   ngx_http_htaccess_module);
+                if (!is_https && hlcf && hlcf->trust_proxy) {
+                    ngx_list_part_t *part = &r->headers_in.headers.part;
+                    ngx_table_elt_t *hdr = part->elts;
+                    ngx_uint_t       hi;
+                    for (hi = 0;; hi++) {
+                        if (hi >= part->nelts) {
+                            if (part->next == NULL) break;
+                            part = part->next; hdr = part->elts; hi = 0;
+                        }
+                        if (hdr[hi].key.len == sizeof("X-Forwarded-Proto") - 1
+                            && ngx_strncasecmp(hdr[hi].key.data,
+                                (u_char *) "X-Forwarded-Proto",
+                                sizeof("X-Forwarded-Proto") - 1) == 0
+                            && hdr[hi].value.len == 5
+                            && ngx_strncasecmp(hdr[hi].value.data,
+                                (u_char *) "https", 5) == 0)
+                        {
+                            is_https = 1;
+                            break;
+                        }
+                    }
+                }
+                if (is_https) {
+                    val.data = (u_char *) "on";
+                    val.len = 2;
+                } else {
+                    ngx_str_set(&val, "off");
+                }
             } else if (vlen == 11 && ngx_strncasecmp(vs, (u_char *)"THE_REQUEST", 11) == 0) {
                 val = r->request_line;
             } else if (vlen == 13 && ngx_strncasecmp(vs, (u_char *)"DOCUMENT_ROOT", 13) == 0) {
@@ -361,8 +510,11 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule, hta_backref_t *br,
         case HTA_TEST_REGEX:
             if (c->regex) {
                 int       lcaps[HTA_MAX_CAPTURES];
-                ngx_int_t nrc = ngx_regex_exec(c->regex, &expanded, lcaps,
+                ngx_int_t nrc = hta_regex_exec(c->regex, &expanded, lcaps,
                                                HTA_MAX_CAPTURES);
+                if (nrc == HTA_REGEX_ERROR) {
+                    return NGX_ERROR;
+                }
                 match = (nrc >= 0);
                 if (match && !(c->flags & HTA_CF_NEGATE)) {
                     /* remember captures for %1-%9 in the substitution; the
@@ -379,34 +531,34 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule, hta_backref_t *br,
         case HTA_TEST_FILE: {
             ngx_file_info_t fi;
             /* Security: reject path traversal in file tests */
-            if (ngx_strstr(expanded.data, "..") != NULL) break;
+            if (!hta_path_inside_root(r, &expanded)) break;
             match = (ngx_file_info(expanded.data, &fi) == 0
                      && ngx_is_file(&fi));
             break;
         }
         case HTA_TEST_DIR: {
             ngx_file_info_t fi;
-            if (ngx_strstr(expanded.data, "..") != NULL) break;
+            if (!hta_path_inside_root(r, &expanded)) break;
             match = (ngx_file_info(expanded.data, &fi) == 0
                      && ngx_is_dir(&fi));
             break;
         }
         case HTA_TEST_LINK: {
             struct stat st;
-            if (ngx_strstr(expanded.data, "..") != NULL) break;
+            if (!hta_path_inside_root(r, &expanded)) break;
             match = (lstat((char *)expanded.data, &st) == 0
                      && S_ISLNK(st.st_mode));
             break;
         }
         case HTA_TEST_EXISTS: {
             ngx_file_info_t fi;
-            if (ngx_strstr(expanded.data, "..") != NULL) break;
+            if (!hta_path_inside_root(r, &expanded)) break;
             match = (ngx_file_info(expanded.data, &fi) == 0);
             break;
         }
         case HTA_TEST_SIZE: {
             ngx_file_info_t fi;
-            if (ngx_strstr(expanded.data, "..") != NULL) break;
+            if (!hta_path_inside_root(r, &expanded)) break;
             match = (ngx_file_info(expanded.data, &fi) == 0
                      && ngx_file_size(&fi) > 0);
             break;
@@ -497,13 +649,28 @@ hta_apply_dirindex(ngx_http_request_t *r, hta_parsed_t *h)
     if (h->nindex == 0) return NGX_DECLINED;
     if (r->uri.len == 0 || r->uri.data[r->uri.len - 1] != '/')
         return NGX_DECLINED;
+    if (hta_uri_has_dotdot(&r->uri)) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
     for (i = 0; i < h->nindex; i++) {
-        ngx_int_t plen = ngx_snprintf(path, sizeof(path) - 1,
-                                       "%V%V%V", &clcf->root, &r->uri,
-                                       &h->index_files[i]) - path;
+        ngx_int_t plen;
+
+        if (hta_uri_has_dotdot(&h->index_files[i])
+            || (h->index_files[i].len > 0
+                && h->index_files[i].data[0] == '/'))
+        {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        plen = ngx_snprintf(path, sizeof(path), "%V%V%V",
+                            &clcf->root, &r->uri,
+                            &h->index_files[i]) - path;
+        if (plen < 0 || plen >= (ngx_int_t) sizeof(path) - 1) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
         path[plen] = '\0';
 
         if (ngx_file_info(path, &fi) == 0 && ngx_is_file(&fi)) {
@@ -535,16 +702,26 @@ hta_apply_dirindex(ngx_http_request_t *r, hta_parsed_t *h)
 ngx_int_t
 hta_apply_fallback(ngx_http_request_t *r, ngx_str_t *fallback)
 {
-    ngx_str_t       path;
+    ngx_str_t       path, target;
     size_t          rl;
     u_char         *last;
     ngx_file_info_t fi;
 
     if (fallback->len == 0) return NGX_DECLINED;
 
+    if (hta_pstrdup(r, &target, fallback) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (hta_value_has_crlf(&target) || hta_uri_has_dotdot(&target)
+        || target.len == 0 || target.data[0] != '/')
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
     /* avoid an internal-redirect loop onto the fallback itself */
-    if (r->uri.len == fallback->len
-        && ngx_strncmp(r->uri.data, fallback->data, fallback->len) == 0)
+    if (r->uri.len == target.len
+        && ngx_strncmp(r->uri.data, target.data, target.len) == 0)
         return NGX_DECLINED;
 
     /* only fall back when the request maps to no existing file or directory */
@@ -557,7 +734,7 @@ hta_apply_fallback(ngx_http_request_t *r, ngx_str_t *fallback)
             return NGX_DECLINED;
     }
 
-    return ngx_http_internal_redirect(r, fallback, &r->args);
+    return hta_internal_redirect(r, &target, &r->args);
 }
 
 
@@ -577,18 +754,39 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
 
     if (!h->rewrite_on || h->nrules == 0) return NGX_DECLINED;
 
-    /* strip leading slash / rewrite base for per-dir context */
+    /*
+     * Apache per-directory context: the match subject is the request path
+     * relative to the directory containing this .htaccess, with the leading
+     * slash removed.  RewriteBase only affects relative substitutions, not
+     * the match subject.  The old code stripped only "/" (or RewriteBase),
+     * so ^secret$ in /private/.htaccess was matched against "private/secret"
+     * and never fired.
+     */
     uri = r->uri;
     if (uri.len > 0 && uri.data[0] == '/') {
-        if (h->rewrite_base.len > 0 && uri.len >= h->rewrite_base.len &&
-            ngx_strncmp(uri.data, h->rewrite_base.data,
-                        h->rewrite_base.len) == 0)
+        ngx_http_core_loc_conf_t *clcf;
+        size_t                    skip = 1;
+
+        clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+        if (clcf != NULL && clcf->alias != 0
+            && clcf->alias != NGX_MAX_SIZE_T_VALUE
+            && clcf->alias <= uri.len)
         {
-            uri.data += h->rewrite_base.len;
-            uri.len  -= h->rewrite_base.len;
+            skip = clcf->alias;
+        }
+
+        if (h->dir_rel.len > 0
+            && uri.len >= skip + h->dir_rel.len
+            && ngx_strncmp(uri.data + skip, h->dir_rel.data,
+                           h->dir_rel.len) == 0)
+        {
+            uri.data += skip + h->dir_rel.len;
+            uri.len  -= skip + h->dir_rel.len;
         } else {
-            uri.data++;
-            uri.len--;
+            if (uri.len >= skip) {
+                uri.data += skip;
+                uri.len  -= skip;
+            }
         }
     }
 
@@ -607,22 +805,41 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
 
         /* Apache evaluates the RewriteRule pattern FIRST; the RewriteConds run
          * only if it matches, and can back-reference its captures via $N. */
-        rc = ngx_regex_exec(rule->regex, &uri, caps, HTA_MAX_CAPTURES);
-        if (rc == NGX_REGEX_NO_MATCHED) {
+        rc = hta_regex_exec(rule->regex, &uri, caps, HTA_MAX_CAPTURES);
+        if (rc == HTA_REGEX_ERROR) {
+            return NGX_ERROR;
+        }
+
+        if (rule->flags & HTA_F_NOT) {
+            if (rc >= 0) {
+                /* pattern matched, so the negated rule does not */
+                if (rule->flags & HTA_F_CHAIN) {
+                    ngx_uint_t j = i + 1;
+                    while (j < h->nrules
+                           && h->rules[j-1].flags & HTA_F_CHAIN) j++;
+                    i = j - 1;
+                }
+                continue;
+            }
+            rc = NGX_REGEX_NO_MATCHED;
+        } else if (rc == NGX_REGEX_NO_MATCHED) {
             if (rule->flags & HTA_F_CHAIN) {
                 ngx_uint_t j = i + 1;
                 while (j < h->nrules && h->rules[j-1].flags & HTA_F_CHAIN) j++;
                 i = j - 1;
             }
             continue;
+        } else if (rc < 0) {
+            return NGX_ERROR;
         }
-        if (rc < 0) continue;
 
         ngx_memzero(&br, sizeof(br));
         br.rule_subject = uri;
-        br.rule_caps    = caps;
-        br.rule_ncaps   = (rc > 0) ? (ngx_uint_t) rc * 2 : 2;
-        br.have_rule    = 1;
+        if (!(rule->flags & HTA_F_NOT)) {
+            br.rule_caps  = caps;
+            br.rule_ncaps = (rc > 0) ? (ngx_uint_t) rc * 2 : 2;
+            br.have_rule  = 1;
+        }
 
         /* now the conditions (they see $N from the rule and capture %N) */
         {
@@ -660,8 +877,11 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
                     /* the E= value may reference %{VAR}/$N/%N, e.g.
                      * [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}] */
                     ngx_str_t ev;
-                    if (hta_expand_full(r, &rule->env_val, &ev, &br) != NGX_OK)
-                        ev = rule->env_val;
+                    if (hta_expand_full(r, &rule->env_val, &ev, &br) != NGX_OK
+                        && hta_pstrdup(r, &ev, &rule->env_val) != NGX_OK)
+                    {
+                        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    }
                     vv->data = ev.data;
                     vv->len = ev.len;
                     vv->valid = 1;
@@ -696,6 +916,16 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
 
         if (rule->flags & HTA_F_SKIP) skip = rule->skip_count;
 
+        /*
+         * Never let a customer-supplied substitution write CR/LF into a
+         * Location header, or escape the document root with "..".
+         */
+        if (hta_value_has_crlf(&nuri) || hta_uri_has_dotdot(&nuri)) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "htaccess: unsafe rewrite target, failing closed");
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
         /* external redirect? */
         if ((rule->flags & HTA_F_REDIRECT) ||
             (nuri.len >= 7 &&
@@ -726,6 +956,10 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
                 }
             }
 
+            if (hta_value_has_crlf(&nuri)) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
             loc = ngx_list_push(&r->headers_out.headers);
             if (loc == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
             loc->hash = 1;
@@ -751,12 +985,16 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
                     nuri.data = pre; nuri.len = plen;
                 }
             } else {
-                pre = ngx_pnalloc(r->pool, 1 + nuri.len + 1);
+                ngx_uint_t plen = 1 + h->dir_rel.len + nuri.len;
+                pre = ngx_pnalloc(r->pool, plen + 1);
                 if (pre) {
                     pre[0] = '/';
-                    ngx_memcpy(pre + 1, nuri.data, nuri.len);
-                    pre[1 + nuri.len] = '\0';
-                    nuri.data = pre; nuri.len = 1 + nuri.len;
+                    if (h->dir_rel.len > 0) {
+                        ngx_memcpy(pre + 1, h->dir_rel.data, h->dir_rel.len);
+                    }
+                    ngx_memcpy(pre + 1 + h->dir_rel.len, nuri.data, nuri.len);
+                    pre[plen] = '\0';
+                    nuri.data = pre; nuri.len = plen;
                 }
             }
         }
@@ -797,14 +1035,27 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
         changed = 1;
         uri = nuri;
         if (uri.len > 0 && uri.data[0] == '/') {
-            if (h->rewrite_base.len > 0 && uri.len >= h->rewrite_base.len &&
-                ngx_strncmp(uri.data, h->rewrite_base.data,
-                            h->rewrite_base.len) == 0)
+            ngx_http_core_loc_conf_t *clcf2;
+            size_t                    skip2 = 1;
+
+            clcf2 = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+            if (clcf2 != NULL && clcf2->alias != 0
+                && clcf2->alias != NGX_MAX_SIZE_T_VALUE
+                && clcf2->alias <= uri.len)
             {
-                uri.data += h->rewrite_base.len;
-                uri.len  -= h->rewrite_base.len;
-            } else {
-                uri.data++; uri.len--;
+                skip2 = clcf2->alias;
+            }
+
+            if (h->dir_rel.len > 0
+                && uri.len >= skip2 + h->dir_rel.len
+                && ngx_strncmp(uri.data + skip2, h->dir_rel.data,
+                               h->dir_rel.len) == 0)
+            {
+                uri.data += skip2 + h->dir_rel.len;
+                uri.len  -= skip2 + h->dir_rel.len;
+            } else if (uri.len >= skip2) {
+                uri.data += skip2;
+                uri.len  -= skip2;
             }
         }
     }
@@ -832,26 +1083,60 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
  * Called before RewriteRule processing.
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/*
+ * ngx_http_internal_redirect() increments r->main->count.  The rewrite/access
+ * phase checkers return NGX_OK for NGX_DONE without finalizing the request,
+ * so a caller in those phases must drop the extra reference itself.
+ */
+static ngx_int_t
+hta_internal_redirect(ngx_http_request_t *r, ngx_str_t *uri, ngx_str_t *args)
+{
+    ngx_int_t rc = ngx_http_internal_redirect(r, uri, args);
+    ngx_http_finalize_request(r, NGX_DONE);
+    return rc;
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * ErrorDocument - redirect to custom error page for a given status code
  * Returns the original status if no ErrorDocument is configured
  * ═══════════════════════════════════════════════════════════════════════ */
 
 ngx_int_t
-hta_check_errdoc(ngx_http_request_t *r, hta_parsed_t *h, ngx_int_t status)
+hta_check_errdoc(ngx_http_request_t *r, hta_errdoc_t *errdocs,
+    ngx_uint_t nerrdocs, ngx_int_t status)
 {
     ngx_uint_t i;
 
-    if (h->nerrdocs == 0 || status < 400) return status;
+    if (nerrdocs == 0 || status < 400) return status;
+    if (r->error_page) return status;  /* already serving an error page */
 
-    for (i = 0; i < h->nerrdocs; i++) {
-        if (h->errdocs[i].code == status) {
-            if (h->errdocs[i].is_url) {
+    /* Deepest .htaccess wins, matching Apache's nearest-scope precedence. */
+    for (i = nerrdocs; i > 0; i--) {
+        ngx_uint_t idx = i - 1;
+
+        if (errdocs[idx].code == status) {
+            if (errdocs[idx].is_url) {
                 ngx_table_elt_t *loc;
-                if (h->errdocs[i].response.data[0] == '/') {
-                    /* internal URL - do internal redirect */
-                    return ngx_http_internal_redirect(r,
-                        &h->errdocs[i].response, &r->args);
+                ngx_str_t        uri;
+
+                if (hta_pstrdup(r, &uri, &errdocs[idx].response) != NGX_OK) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                if (hta_value_has_crlf(&uri) || hta_uri_has_dotdot(&uri)) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+
+                if (uri.data[0] == '/') {
+                    /*
+                     * Preserve the original status on the custom error page
+                     * (Apache semantics: /errors/404.html is served with 404,
+                     * not 200).  r->err_status survives internal_redirect and
+                     * is applied by the header filter.
+                     */
+                    r->err_status = status;
+                    r->error_page = 1;
+                    return hta_internal_redirect(r, &uri, &r->args);
                 }
                 /* external URL - 302 redirect */
                 loc = ngx_list_push(
@@ -859,7 +1144,7 @@ hta_check_errdoc(ngx_http_request_t *r, hta_parsed_t *h, ngx_int_t status)
                 if (loc == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 loc->hash = 1;
                 ngx_str_set(&loc->key, "Location");
-                loc->value = h->errdocs[i].response;
+                loc->value = uri;
                 r->headers_out.status = 302;
                 r->headers_out.content_length_n = 0;
                 return 302;
@@ -885,9 +1170,11 @@ static void
 hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
     unsigned do_unset)
 {
-    ngx_str_t                  lname;
-    ngx_uint_t                 k, hash;
-    ngx_http_variable_value_t *vv;
+    ngx_str_t                   lname, copy;
+    ngx_uint_t                  k, hash;
+    ngx_http_core_main_conf_t  *cmcf;
+    ngx_http_variable_t        *var;
+    ngx_http_variable_value_t  *vv;
 
     if (name->len == 0) return;
 
@@ -898,6 +1185,21 @@ hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
         lname.data[k] = ngx_tolower(name->data[k]);
 
     hash = ngx_hash_key(lname.data, lname.len);
+
+    /*
+     * Only variables explicitly declared with set/map/changeable are safe
+     * to overwrite.  Apache env vars live in a separate namespace; writing
+     * $host/$request_uri/$https from .htaccess would let a customer affect
+     * nginx.conf if/map/return checks.
+     */
+    cmcf = ngx_http_get_module_main_conf(r, ngx_http_core_module);
+    var = ngx_hash_find(&cmcf->variables_hash, hash, lname.data, lname.len);
+    if (var == NULL || !(var->flags & NGX_HTTP_VAR_CHANGEABLE)) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "htaccess: refusing to overwrite nginx variable \"%V\"", &lname);
+        return;
+    }
+
     vv = ngx_http_get_variable(r, &lname, hash);
     if (vv == NULL) return;
 
@@ -908,8 +1210,9 @@ hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
         vv->len = 0;
         vv->data = NULL;
     } else {
-        vv->data = value->data;
-        vv->len  = value->len;
+        if (hta_pstrdup(r, &copy, value) != NGX_OK) return;
+        vv->data = copy.data;
+        vv->len  = copy.len;
         vv->valid = 1;
         vv->not_found = 0;
         vv->no_cacheable = 0;
@@ -917,12 +1220,12 @@ hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
 }
 
 
-void
+ngx_int_t
 hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h)
 {
     ngx_uint_t i;
 
-    if (h->nsetenvifs == 0) return;
+    if (h->nsetenvifs == 0) return NGX_OK;
 
     for (i = 0; i < h->nsetenvifs; i++) {
         hta_setenvif_t *se = &h->setenvifs[i];
@@ -994,8 +1297,11 @@ hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h)
         /* match regex against attribute value */
         if (se->regex && test_val.len > 0) {
             int       caps[HTA_MAX_CAPTURES];
-            ngx_int_t nrc = ngx_regex_exec(se->regex, &test_val, caps,
+            ngx_int_t nrc = hta_regex_exec(se->regex, &test_val, caps,
                                            HTA_MAX_CAPTURES);
+            if (nrc == HTA_REGEX_ERROR) {
+                return NGX_ERROR;
+            }
             if (nrc >= 0) {
                 ngx_str_t value = se->env_value;
                 /* expand $1-$9 from the match into the env value, e.g.
@@ -1018,6 +1324,8 @@ hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h)
             }
         }
     }
+
+    return NGX_OK;
 }
 
 
@@ -1143,85 +1451,144 @@ hta_expand_hdr_value(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst)
 }
 
 
+static ngx_int_t
+hta_framing_header(ngx_str_t *name)
+{
+    static const char *names[] = {
+        "content-length", "transfer-encoding", "connection",
+        "keep-alive", "proxy-connection", "upgrade", "te", "trailer", NULL
+    };
+    ngx_uint_t i;
+
+    for (i = 0; names[i]; i++) {
+        size_t len = ngx_strlen(names[i]);
+        if (name->len == len
+            && ngx_strncasecmp(name->data, (u_char *) names[i], len) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static ngx_int_t
+hta_proxy_header(ngx_str_t *name)
+{
+    return (name->len >= 11
+            && ngx_strncasecmp(name->data, (u_char *) "x-forwarded-", 11) == 0)
+        || (name->len >= 9
+            && ngx_strncasecmp(name->data, (u_char *) "x-real-ip", 9) == 0)
+        || (name->len >= 9
+            && ngx_strncasecmp(name->data, (u_char *) "forwarded", 9) == 0)
+        || (name->len >= 5
+            && ngx_strncasecmp(name->data, (u_char *) "proxy", 5) == 0)
+        || (name->len >= 11
+            && ngx_strncasecmp(name->data, (u_char *) "x-original-", 11) == 0);
+}
+
 void
 hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
 {
-    ngx_uint_t       i;
-    hta_header_t    *hd;
-    ngx_table_elt_t *elt;
+    ngx_uint_t                i;
+    hta_header_t             *hd;
+    ngx_table_elt_t          *elt;
+    ngx_http_hta_loc_conf_t  *lcf;
 
     if (h->nreq_headers == 0) return;
 
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_htaccess_module);
+
     for (i = 0; i < h->nreq_headers; i++) {
-        ngx_str_t hv;
+        ngx_str_t name, hv, value;
 
         hd = &h->req_headers[i];
+        if (hta_pstrdup(r, &name, &hd->name) != NGX_OK) return;
+
+        if (hd->action != HTA_HDR_UNSET && hta_framing_header(&name)) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "htaccess: refusing to set framing request header \"%V\"",
+                &name);
+            continue;
+        }
+
+        if (hd->action != HTA_HDR_UNSET
+            && (lcf == NULL || !lcf->allow_proxy_headers)
+            && hta_proxy_header(&name))
+        {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "htaccess: refusing to forge proxy header \"%V\"", &name);
+            continue;
+        }
+
         if (hta_expand_hdr_value(r, &hd->value, &hv) != NGX_OK) hv = hd->value;
+        if (hta_pstrdup(r, &value, &hv) != NGX_OK) return;
+
+        if (hta_value_has_crlf(&value)) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "htaccess: sanitizing CR/LF in RequestHeader value");
+            hta_value_sanitize(&value);
+        }
 
         switch (hd->action) {
         case HTA_HDR_UNSET:
-            elt = hta_find_req_header(r, &hd->name);
+            elt = hta_find_req_header(r, &name);
             while (elt != NULL) {
                 elt->hash = 0;
                 elt->value.len = 0;
-                elt = hta_find_req_header(r, &hd->name);
+                elt = hta_find_req_header(r, &name);
             }
-            hta_repoint_indexed(r, &hd->name, NULL);
+            hta_repoint_indexed(r, &name, NULL);
             break;
 
         case HTA_HDR_SET:
             /* drop all existing copies, then add fresh */
-            elt = hta_find_req_header(r, &hd->name);
+            elt = hta_find_req_header(r, &name);
             while (elt != NULL) {
                 elt->hash = 0;
                 elt->value.len = 0;
-                elt = hta_find_req_header(r, &hd->name);
+                elt = hta_find_req_header(r, &name);
             }
-            /* FALLTHROUGH */
             /* fall through */
         case HTA_HDR_ADD:
         case HTA_HDR_APPEND:
             elt = ngx_list_push(&r->headers_in.headers);
             if (elt == NULL) return;
             ngx_memzero(elt, sizeof(ngx_table_elt_t));
-            elt->key   = hd->name;
-            elt->value = hv;
+            elt->key   = name;
+            elt->value = value;
             elt->hash  = 1;
             /* nginx hashes lowercase header names for indexed lookups */
-            elt->lowcase_key = ngx_pnalloc(r->pool, hd->name.len);
+            elt->lowcase_key = ngx_pnalloc(r->pool, name.len);
             if (elt->lowcase_key) {
                 ngx_uint_t k;
-                for (k = 0; k < hd->name.len; k++)
-                    elt->lowcase_key[k] = ngx_tolower(hd->name.data[k]);
+                for (k = 0; k < name.len; k++)
+                    elt->lowcase_key[k] = ngx_tolower(name.data[k]);
             }
-            hta_repoint_indexed(r, &hd->name, elt);
+            hta_repoint_indexed(r, &name, elt);
             break;
 
         case HTA_HDR_MERGE: {
             /* merge: if entry exists and already contains value, skip; else
              * append a fresh entry like APPEND */
-            ngx_table_elt_t *existing = hta_find_req_header(r, &hd->name);
-            if (existing
-                && hv.len > 0
-                && existing->value.len >= hv.len
-                && ngx_strnstr(existing->value.data,
-                       (char *)hv.data, existing->value.len) != NULL)
+            ngx_table_elt_t *existing = hta_find_req_header(r, &name);
+            if (existing && value.len > 0
+                && hta_value_contains(&existing->value, &value))
             {
                 break;
             }
             elt = ngx_list_push(&r->headers_in.headers);
             if (elt == NULL) return;
             ngx_memzero(elt, sizeof(ngx_table_elt_t));
-            elt->key   = hd->name;
-            elt->value = hv;
+            elt->key   = name;
+            elt->value = value;
             elt->hash  = 1;
-            elt->lowcase_key = ngx_pnalloc(r->pool, hd->name.len);
+            elt->lowcase_key = ngx_pnalloc(r->pool, name.len);
             if (elt->lowcase_key) {
                 ngx_uint_t k;
-                for (k = 0; k < hd->name.len; k++)
-                    elt->lowcase_key[k] = ngx_tolower(hd->name.data[k]);
+                for (k = 0; k < name.len; k++)
+                    elt->lowcase_key[k] = ngx_tolower(name.data[k]);
             }
-            hta_repoint_indexed(r, &hd->name, elt);
+            hta_repoint_indexed(r, &name, elt);
             break;
         }
         }
@@ -1246,9 +1613,12 @@ hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h)
             ngx_str_t        target;
             ngx_table_elt_t *loc;
 
-            rc = ngx_regex_exec(rd->regex, &r->uri, caps,
+            rc = hta_regex_exec(rd->regex, &r->uri, caps,
                                 HTA_MAX_CAPTURES);
-            if (rc < 0) continue;
+            if (rc == HTA_REGEX_ERROR) {
+                return NGX_ERROR;
+            }
+            if (rc == NGX_REGEX_NO_MATCHED) continue;
 
             /* 410 Gone - no target needed */
             if (rd->status == 410) return 410;
@@ -1304,6 +1674,10 @@ hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h)
                 }
             }
 
+            if (hta_value_has_crlf(&target)) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
             loc = ngx_list_push(&r->headers_out.headers);
             if (loc == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
             loc->hash = 1;
@@ -1354,6 +1728,10 @@ hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h)
                                                  &target, &r->args) - qt;
                         target.data = qt;
                     }
+                }
+
+                if (hta_value_has_crlf(&target)) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
                 }
 
                 loc = ngx_list_push(

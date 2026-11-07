@@ -32,8 +32,8 @@ RewriteCond %{HTTP_HOST} ^test\.example\.com$
 RewriteRule ^cond-host$ /rewrite/target.html [R=302,L]
 
 # RewriteCond on REQUEST_URI
-RewriteCond %{REQUEST_URI} ^/rewrite/cond-uri
-RewriteRule .* /rewrite/target.html [L]
+RewriteCond %{REQUEST_URI} ^/rewrite/cond-uri$
+RewriteRule ^cond-uri$ /rewrite/target.html [L]
 
 # RewriteCond negation
 RewriteCond %{REQUEST_URI} !^/rewrite/target

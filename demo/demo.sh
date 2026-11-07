@@ -4,6 +4,22 @@
 
 cd "$(dirname "$0")"
 
+# The WordPress demo requires credentials; generate them once into demo/.env
+# (chmod 600, git-ignored).  No default passwords are shipped.
+ensure_demo_env() {
+    [ -f .env ] && return 0
+    local rootpass userpass
+    rootpass=$(openssl rand -hex 16 2>/dev/null || true)
+    [ -n "$rootpass" ] || rootpass=$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32)
+    userpass=$(openssl rand -hex 16 2>/dev/null || true)
+    [ -n "$userpass" ] || userpass=$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32)
+    printf 'MYSQL_ROOT_PASSWORD=%s\nMYSQL_PASSWORD=%s\nMYSQL_DATABASE=wordpress\nMYSQL_USER=wp\n' \
+        "$rootpass" "$userpass" > .env
+    chmod 600 .env
+    echo "Generated demo/.env with random MySQL credentials."
+}
+ensure_demo_env
+
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
@@ -185,7 +201,7 @@ while true; do
             $DC -f docker-compose.wordpress.yml up -d
             echo ""
             echo -e "${GREEN}WordPress available at: ${BOLD}http://localhost:8080${NC}"
-            echo -e "MySQL: host=mysql db=wordpress user=wp pass=wppass"
+            echo -e "MySQL credentials: see demo/.env"
             wait_key
             ;;
         7)
@@ -196,7 +212,7 @@ while true; do
             $DC -f docker-compose.wordpress.yml up -d
             echo ""
             echo -e "${GREEN}WordPress available at: ${BOLD}http://localhost:8080${NC}"
-            echo -e "MySQL: host=mysql db=wordpress user=wp pass=wppass"
+            echo -e "MySQL credentials: see demo/.env"
             wait_key
             ;;
         8)
