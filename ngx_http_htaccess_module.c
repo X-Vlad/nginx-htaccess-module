@@ -888,13 +888,34 @@ hta_protected_security_header(ngx_str_t *name)
  * Directory traversal - find all .htaccess files from root to deepest dir
  * ═══════════════════════════════════════════════════════════════════════ */
 
+/*
+ * Is there a .htaccess entry at path?  lstat(), not stat(): a symlinked
+ * .htaccess whose target nginx cannot reach (another tenant's home) made
+ * stat() fail and the file was skipped, so its rules silently did not
+ * apply; now it is collected and refused at open (O_NOFOLLOW, 500).  Any
+ * error other than "does not exist" fails the request closed.
+ */
+static ngx_int_t
+hta_ht_present(u_char *path, hta_file_list_t *list)
+{
+    struct stat st;
+
+    if (lstat((char *) path, &st) == 0) {
+        return 1;
+    }
+    if (errno != ENOENT && errno != ENOTDIR) {
+        list->error = 1;
+    }
+    return 0;
+}
+
+
 void
 hta_collect_files(ngx_http_request_t *r, ngx_str_t *root, ngx_str_t *filename,
     hta_file_list_t *list)
 {
     u_char          path[HTA_MAX_PATH];
     ngx_int_t       plen;
-    ngx_file_info_t fi;
     u_char         *uri_p, *uri_end;
     u_char          dir[HTA_MAX_PATH];
     ngx_int_t       dlen;
@@ -921,7 +942,7 @@ hta_collect_files(ngx_http_request_t *r, ngx_str_t *root, ngx_str_t *filename,
                                     filename->len) - (path + plen));
     path[plen] = '\0';
 
-    if (ngx_file_info(path, &fi) == 0 && ngx_is_file(&fi)) {
+    if (hta_ht_present(path, list)) {
         list->files[list->count].data = ngx_pnalloc(r->pool, plen + 1);
         if (list->files[list->count].data == NULL) {
             list->error = 1;
@@ -1007,7 +1028,7 @@ hta_collect_files(ngx_http_request_t *r, ngx_str_t *root, ngx_str_t *filename,
         }
         path[plen] = '\0';
 
-        if (ngx_file_info(path, &fi) == 0 && ngx_is_file(&fi)) {
+        if (hta_ht_present(path, list)) {
             list->files[list->count].data = ngx_pnalloc(r->pool, plen + 1);
             if (list->files[list->count].data == NULL) {
                 list->error = 1;

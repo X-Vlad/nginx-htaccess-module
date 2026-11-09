@@ -334,9 +334,21 @@ cd nginx-X.Y.Z
 ./configure --with-compat --add-dynamic-module=/path/to/nginx-htaccess-module
 make modules
 
-# Install
-sudo cp objs/ngx_http_htaccess_module.so /usr/lib/nginx/modules/
+# Install (install(1) writes a new file; cp would overwrite the library a
+# running nginx has mapped and crash its workers)
+sudo install -m 0644 objs/ngx_http_htaccess_module.so /usr/lib/nginx/modules/
+echo 'load_module /usr/lib/nginx/modules/ngx_http_htaccess_module.so;' \
+  | sudo tee /etc/nginx/modules-enabled/50-mod-http-htaccess.conf
+sudo nginx -t && sudo systemctl restart nginx
 ```
+
+**Upgrading the module.** Build it against the exact nginx version that runs
+(`nginx -v`), install it as a new file (`install`, or write it next to the old
+one and `mv` it over), then **restart** nginx (or do a binary upgrade with
+`USR2`). `nginx -s reload` is not enough: nginx keeps dynamic modules loaded
+across reloads, so the workers would go on running the old module. Check with
+`grep 'ngx_http_htaccess_module.so (deleted)' /proc/$(pgrep -f 'nginx: worker' | head -1)/maps`:
+any output means the old module is still running.
 
 ### Build as Static Module
 

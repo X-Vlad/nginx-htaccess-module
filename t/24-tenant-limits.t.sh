@@ -190,4 +190,15 @@ out=$(curl -s -m 30 -o /dev/null -w '%{http_code} %{time_total}' "${BASE_URL}/se
 t=${out#* }
 if awk -v t="$t" 'BEGIN { exit !(t < 0.5) }'; then pass; else fail "got $out"; fi
 
+# A symlinked .htaccess whose target nginx cannot reach must not be skipped
+# (its rules would silently not apply): it is refused like any symlinked one.
+mkdir -p "$L/unreach" /tmp/hta-unreach.$$
+chmod 700 /tmp/hta-unreach.$$
+printf 'Require all granted\n' > /tmp/hta-unreach.$$/target
+printf 'page\n' > "$L/unreach/page.html"
+ln -s /tmp/hta-unreach.$$/target "$L/unreach/.htaccess"
+begin_test "symlinked .htaccess to an unreachable target fails closed"
+assert_status GET /sec/limits/unreach/page.html 500
+rm -rf /tmp/hta-unreach.$$
+
 rm -rf "$L"
