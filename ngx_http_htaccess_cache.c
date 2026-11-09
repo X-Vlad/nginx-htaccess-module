@@ -83,6 +83,7 @@ hta_cache_put(ngx_http_hta_main_conf_t *mc, u_char *path, ngx_uint_t plen,
             }
             mc->cache[i].parsed = parsed;
             mc->cache[i].mtime  = parsed ? parsed->mtime : 0;
+            if (parsed) mc->cache[i].fver = parsed->fver;
             /* Re-arm the inotify watch. After the first invalidation the watch
              * descriptor was cleared (wd=-1); without re-adding it here only the
              * first edit per file would ever be detected and later edits would
@@ -91,7 +92,7 @@ hta_cache_put(ngx_http_hta_main_conf_t *mc, u_char *path, ngx_uint_t plen,
              * one after IN_DELETE_SELF/IN_MOVE_SELF. */
             if (mc->inotify_fd != -1 && parsed && mc->cache[i].wd == -1) {
                 mc->cache[i].wd = inotify_add_watch(mc->inotify_fd,
-                    (char *) path, IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF);
+                    (char *) path, IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
             }
             return;
         }
@@ -126,6 +127,7 @@ hta_cache_put(ngx_http_hta_main_conf_t *mc, u_char *path, ngx_uint_t plen,
     e->path_hash  = h;
     e->parsed     = parsed;
     e->mtime      = parsed ? parsed->mtime : 0;
+    if (parsed) e->fver = parsed->fver;
     e->wd         = -1;
 
     if (parsed) {
@@ -134,7 +136,7 @@ hta_cache_put(ngx_http_hta_main_conf_t *mc, u_char *path, ngx_uint_t plen,
 
     if (mc->inotify_fd != -1 && parsed) {
         e->wd = inotify_add_watch(mc->inotify_fd, (char *)path,
-                                   IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF);
+                                   IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
     }
     mc->ncache++;
 }
@@ -190,7 +192,9 @@ hta_inotify_poll(ngx_http_hta_main_conf_t *mc, ngx_log_t *log)
                     }
                     mc->cache[i].parsed = NULL;
                     mc->cache[i].wd     = -1;
-                    break;
+                    /* no break: one inode reached through two paths (a
+                     * directory symlink inside the root) shares one watch,
+                     * and every entry of it must go */
                 }
             }
 
@@ -285,8 +289,13 @@ hta_get_parsed(ngx_http_request_t *r, ngx_http_hta_main_conf_t *mc,
                     break;
                 }
 
-                if (ngx_file_info(filepath->data, &si) != 0
-                    || ngx_file_mtime(&si) != mc->cache[ci].mtime)
+                hta_fver_t now;
+                ngx_int_t  gone = (ngx_file_info(filepath->data, &si) != 0);
+
+                if (!gone) {
+                    hta_fver_set(&now, &si);
+                }
+                if (gone || !hta_fver_eq(&now, &mc->cache[ci].fver))
                 {
                     mc->cache_bytes -= mc->cache[ci].parsed->mem_size;
                     ngx_destroy_pool(mc->cache[ci].parsed->pool);

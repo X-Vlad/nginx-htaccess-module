@@ -70,11 +70,17 @@ static ngx_int_t hta_init_process(ngx_cycle_t *cycle);
 static void      hta_exit_process(ngx_cycle_t *cycle);
 static void     *hta_create_main(ngx_conf_t *cf);
 static void     *hta_create_loc(ngx_conf_t *cf);
+static char     *hta_conf_env_allow(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char     *hta_merge_loc(ngx_conf_t *cf, void *parent, void *child);
 
 static ngx_int_t hta_rewrite_handler(ngx_http_request_t *r);
 static ngx_int_t hta_preaccess_handler(ngx_http_request_t *r);
 static ngx_int_t hta_access_handler(ngx_http_request_t *r);
+static ngx_int_t hta_rewrite_entry(ngx_http_request_t *r);
+static ngx_int_t hta_preaccess_entry(ngx_http_request_t *r);
+static ngx_int_t hta_access_entry(ngx_http_request_t *r);
+static ngx_int_t hta_header_entry(ngx_http_request_t *r);
 
 static ngx_int_t
 hta_is_ht_basename(u_char *data, size_t len)
@@ -204,6 +210,18 @@ static ngx_command_t hta_commands[] = {
       offsetof(ngx_http_hta_loc_conf_t, symlink_check),
       NULL },
 
+    /* Variables SetEnv/SetEnvIf/UnsetEnv/BrowserMatch may write: names, or
+     * prefixes ending in "*"; "*" alone allows every changeable variable
+     * (single-tenant setups).  Default: none, because an operator's own
+     * "set $var" (limit_conn/limit_req keys, flags in if/map) would
+     * otherwise be under every customer's control. */
+    { ngx_string("htaccess_env_allow"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      hta_conf_env_allow,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_hta_loc_conf_t, env_allow),
+      NULL },
+
     ngx_null_command
 };
 
@@ -261,8 +279,40 @@ hta_create_loc(ngx_conf_t *cf)
     conf->allow_dangerous_php = NGX_CONF_UNSET;
     conf->allow_security_unset = NGX_CONF_UNSET;
     conf->symlink_check = NGX_CONF_UNSET;
+    conf->env_allow = NGX_CONF_UNSET_PTR;
     return conf;
 }
+
+/* htaccess_env_allow name ...;  every argument is one name or prefix* */
+static char *
+hta_conf_env_allow(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_hta_loc_conf_t  *lcf = conf;
+    ngx_str_t                *value, *s;
+    ngx_uint_t                i;
+
+    if (lcf->env_allow == NGX_CONF_UNSET_PTR || lcf->env_allow == NULL) {
+        lcf->env_allow = ngx_array_create(cf->pool, 8, sizeof(ngx_str_t));
+        if (lcf->env_allow == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    value = cf->args->elts;
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (value[i].len == 0) {
+            return "takes non-empty names";
+        }
+        s = ngx_array_push(lcf->env_allow);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *s = value[i];
+    }
+
+    return NGX_CONF_OK;
+}
+
 
 static char *
 hta_merge_loc(ngx_conf_t *cf, void *parent, void *child)
@@ -287,6 +337,7 @@ hta_merge_loc(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->allow_security_unset,
                          prev->allow_security_unset, 0);
     ngx_conf_merge_value(conf->symlink_check, prev->symlink_check, 1);
+    ngx_conf_merge_ptr_value(conf->env_allow, prev->env_allow, NULL);
     return NGX_CONF_OK;
 }
 
@@ -339,25 +390,83 @@ hta_postconfigure(ngx_conf_t *cf)
     /* rewrite phase - URL rewriting & directory index */
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
     if (h == NULL) return NGX_ERROR;
-    *h = hta_rewrite_handler;
+    *h = hta_rewrite_entry;
 
     /* preaccess phase - re-apply SetEnvIf/SetEnv so its values stick AFTER
      * any `set $foo "";` in the location's rewrite script (nginx reverses
      * REWRITE_PHASE handler order, so our handler there runs BEFORE `set`). */
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
     if (h == NULL) return NGX_ERROR;
-    *h = hta_preaccess_handler;
+    *h = hta_preaccess_entry;
 
     /* access phase - access control & auth */
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
     if (h == NULL) return NGX_ERROR;
-    *h = hta_access_handler;
+    *h = hta_access_entry;
 
     /* header filter - response headers, expires, content-type */
     hta_header_filter_init(ngx_http_top_header_filter);
-    ngx_http_top_header_filter = hta_header_filter;
+    ngx_http_top_header_filter = hta_header_entry;
 
     return NGX_OK;
+}
+
+
+/*
+ * Entry points: charge customer regexes to the request (hta_regex_enter) and
+ * turn internal errors into 500.  A phase handler that returns NGX_ERROR
+ * makes nginx drop the connection without an answer or a log line; a
+ * regex over its budget must fail closed visibly instead.
+ */
+
+static ngx_int_t
+hta_phase_result(ngx_int_t rc)
+{
+    return rc == NGX_ERROR ? NGX_HTTP_INTERNAL_SERVER_ERROR : rc;
+}
+
+
+static ngx_int_t
+hta_rewrite_entry(ngx_http_request_t *r)
+{
+    ngx_http_request_t *prev = hta_regex_enter(r);
+    ngx_int_t           rc = hta_rewrite_handler(r);
+
+    hta_regex_leave(prev);
+    return hta_phase_result(rc);
+}
+
+
+static ngx_int_t
+hta_preaccess_entry(ngx_http_request_t *r)
+{
+    ngx_http_request_t *prev = hta_regex_enter(r);
+    ngx_int_t           rc = hta_preaccess_handler(r);
+
+    hta_regex_leave(prev);
+    return hta_phase_result(rc);
+}
+
+
+static ngx_int_t
+hta_access_entry(ngx_http_request_t *r)
+{
+    ngx_http_request_t *prev = hta_regex_enter(r);
+    ngx_int_t           rc = hta_access_handler(r);
+
+    hta_regex_leave(prev);
+    return hta_phase_result(rc);
+}
+
+
+static ngx_int_t
+hta_header_entry(ngx_http_request_t *r)
+{
+    ngx_http_request_t *prev = hta_regex_enter(r);
+    ngx_int_t           rc = hta_header_filter(r);
+
+    hta_regex_leave(prev);
+    return rc;
 }
 
 
@@ -524,23 +633,12 @@ hta_request_path_inside_root(ngx_http_request_t *r)
         return 0;
     }
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_htaccess_module);
-    if (ctx == NULL) {
-        ctx = ngx_pcalloc(r->pool, sizeof(hta_req_ctx_t));
-        if (ctx == NULL) return 0;
-        ngx_http_set_ctx(r, ctx, ngx_http_htaccess_module);
-    }
+    ctx = hta_req_ctx(r);
+    if (ctx == NULL) return 0;
 
-    if (!ctx->root_real_set) {
-        if (realpath((char *) clcf->root.data, resolved) == NULL) {
-            return 0;
-        }
-        rlen = ngx_strlen(resolved);
-        ctx->root_real.data = ngx_pnalloc(r->pool, rlen + 1);
-        if (ctx->root_real.data == NULL) return 0;
-        ngx_memcpy(ctx->root_real.data, resolved, rlen + 1);
-        ctx->root_real.len = rlen;
-        ctx->root_real_set = 1;
+    {
+        ngx_str_t rr;
+        if (hta_root_real(r, &rr) != NGX_OK) return 0;
     }
 
     last = ngx_http_map_uri_to_path(r, &path, &rl, 0);
@@ -565,6 +663,51 @@ hta_request_path_inside_root(ngx_http_request_t *r)
         return 0;
     }
     return (n == rlen || resolved[rlen] == '/');
+}
+
+
+/*
+ * realpath() of the location's document root, once per request (it was
+ * resolved again for every file test and auth file).
+ */
+ngx_int_t
+hta_root_real(ngx_http_request_t *r, ngx_str_t *out)
+{
+    ngx_http_core_loc_conf_t *clcf;
+    hta_req_ctx_t            *ctx;
+    char                      resolved[PATH_MAX];
+    size_t                    rlen;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf == NULL || clcf->root.len == 0
+        || clcf->root.len >= HTA_MAX_PATH)
+    {
+        return NGX_ERROR;
+    }
+
+    ctx = hta_req_ctx(r);
+    if (ctx == NULL) return NGX_ERROR;
+
+    /* an internal rewrite can move the request to a location with another
+     * root: resolve again then, never compare against a stale root */
+    if (!ctx->root_real_set || ctx->root_conf != clcf->root.data) {
+        ctx->root_real_set = 0;
+        if (realpath((char *) clcf->root.data, resolved) == NULL) {
+            return NGX_ERROR;
+        }
+        ctx->root_conf = clcf->root.data;
+        /* the old root fd stays open until its pool cleanup runs */
+        ctx->root_fd_set = 0;
+        rlen = ngx_strlen(resolved);
+        ctx->root_real.data = ngx_pnalloc(r->pool, rlen + 1);
+        if (ctx->root_real.data == NULL) return NGX_ERROR;
+        ngx_memcpy(ctx->root_real.data, resolved, rlen + 1);
+        ctx->root_real.len = rlen;
+        ctx->root_real_set = 1;
+    }
+
+    *out = ctx->root_real;
+    return NGX_OK;
 }
 
 
@@ -634,11 +777,20 @@ hta_pstrdup(ngx_http_request_t *r, ngx_str_t *dst, const ngx_str_t *src)
         return NGX_OK;
     }
 
-    dst->data = ngx_pstrdup(r->pool, (ngx_str_t *) src);
+    /*
+     * Always NUL-terminate: copies of paths (an inherited AuthUserFile, file
+     * names) reach stat()/open()/realpath() as C strings.  ngx_pstrdup()
+     * copies exactly len bytes, so the byte after the copy belonged to the
+     * next pool allocation: the path read on into it, and the auth file was
+     * found or not depending on what had been allocated next.
+     */
+    dst->data = ngx_pnalloc(r->pool, src->len + 1);
     if (dst->data == NULL) {
         dst->len = 0;
         return NGX_ERROR;
     }
+    ngx_memcpy(dst->data, src->data, src->len);
+    dst->data[src->len] = '\0';
     dst->len = src->len;
     return NGX_OK;
 }
@@ -679,7 +831,9 @@ static const char *hta_dangerous_php_names[] = {
     "disable_functions", "disable_classes", "extension", "zend_extension",
     "include_path", "error_log", "session.save_path", "upload_tmp_dir",
     "sys_temp_dir", "allow_url_include", "allow_url_fopen", "mail.log",
-    "soap.wsdl_cache_dir", "opcache.preload", "ffi.enable", NULL
+    "soap.wsdl_cache_dir", "opcache.preload", "ffi.enable",
+    "mail.force_extra_parameters", "sendmail_path", "user_ini.filename",
+    "opcache.file_cache", "opcache.restrict_api", NULL
 };
 
 ngx_int_t
@@ -918,8 +1072,23 @@ typedef struct {
     ngx_str_t value;
 } hta_php_copy_t;
 
+static ngx_int_t hta_var_php_value_get(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t is_admin);
+
 static ngx_int_t
 hta_var_php_value(ngx_http_request_t *r, ngx_http_variable_value_t *v,
+    uintptr_t is_admin)
+{
+    ngx_http_request_t *prev = hta_regex_enter(r);
+    ngx_int_t           rc = hta_var_php_value_get(r, v, is_admin);
+
+    hta_regex_leave(prev);
+    return rc;
+}
+
+
+static ngx_int_t
+hta_var_php_value_get(ngx_http_request_t *r, ngx_http_variable_value_t *v,
     uintptr_t is_admin)
 {
     ngx_http_hta_loc_conf_t   *lcf;
@@ -1155,6 +1324,8 @@ hta_preaccess_handler(ngx_http_request_t *r)
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
     }
+
+    hta_apply_late_env(r);
 
     return NGX_DECLINED;
 }
@@ -1468,7 +1639,7 @@ hta_access_handler(ngx_http_request_t *r)
          * assumed servable so we never wrongly 403.
          */
         if (!found_index) {
-#if (nginx_version >= 1024000 && nginx_version <= 1030999)
+#if (nginx_version >= 1024000 && nginx_version <= 1031999)
             hta_index_loc_conf_t *ilcf;
             ilcf = ngx_http_get_module_loc_conf(r, ngx_http_index_module);
             if (ilcf != NULL && ilcf->indices != NULL && index_last != NULL) {

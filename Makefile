@@ -1,4 +1,4 @@
-NGINX_VERSION ?= 1.28.2
+NGINX_VERSION ?= 1.30.6
 NGINX_SRC     ?= /tmp/nginx-$(NGINX_VERSION)
 MODULE_DIR    := $(shell pwd)
 NGINX_BIN     ?= /usr/local/nginx/sbin/nginx

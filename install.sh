@@ -7,7 +7,7 @@
 #
 # Usage:
 #   sudo ./install.sh              # auto-detect nginx version
-#   sudo ./install.sh 1.28.2       # force specific version
+#   sudo ./install.sh 1.30.6       # force specific version
 #   ./install.sh --check           # check if module is installed
 #   ./install.sh --uninstall       # remove module
 # ============================================================================
@@ -31,6 +31,10 @@ CONF_BACKUP=""
 # for the versions used by CI, and verify the PGP signature for anything else.
 NGINX_SHA256_1_28_0="c6b5c6b086c0df9d3ca3ff5e084c1d0ef909e6038279c71c1c3e985f576ff76a"
 NGINX_SHA256_1_28_2="20e5e0f2c917acfb51120eec2fba9a4ba4e1e10fd28465067cc87a7d81a829a3"
+# checked against the nginx.org PGP signatures (2026-11-08)
+NGINX_SHA256_1_24_0="77a2541637b92a621e3ee76776c8b7b40cf6d707e69ba53a940283e30ff2f55d"
+NGINX_SHA256_1_30_6="3cf46f5ed7504d460125866b7bea99fb357f31d887e2e63b35503310e9b8b6c8"
+NGINX_SHA256_1_31_8="0652b760b3b772d2ec17b47c2fc15d9a95e6fe35cd5b877eadc1a62d9bc75af1"
 
 # Common nginx module paths
 MODULES_PATHS=(
@@ -254,6 +258,9 @@ verify_nginx_source() {
     case "$version" in
         1.28.0) expected="$NGINX_SHA256_1_28_0" ;;
         1.28.2) expected="$NGINX_SHA256_1_28_2" ;;
+        1.24.0) expected="$NGINX_SHA256_1_24_0" ;;
+        1.30.6) expected="$NGINX_SHA256_1_30_6" ;;
+        1.31.8) expected="$NGINX_SHA256_1_31_8" ;;
         *)      expected="${NGINX_SHA256:-}" ;;
     esac
 
@@ -592,7 +599,7 @@ main() {
             echo ""
             echo "Options:"
             echo "  (no args)      Auto-detect nginx and install module"
-            echo "  VERSION        Build for specific nginx version (e.g., 1.28.2)"
+            echo "  VERSION        Build for specific nginx version (e.g., 1.30.6)"
             echo "  --check, -c    Check installation status"
             echo "  --uninstall    Remove module"
             echo "  --help, -h     Show this help"

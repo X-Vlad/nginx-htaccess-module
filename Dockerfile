@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
-ARG NGINX_VERSION=1.28.2
-ARG NGINX_SHA256=20e5e0f2c917acfb51120eec2fba9a4ba4e1e10fd28465067cc87a7d81a829a3
+ARG NGINX_VERSION=1.30.6
+ARG NGINX_SHA256=3cf46f5ed7504d460125866b7bea99fb357f31d887e2e63b35503310e9b8b6c8
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -50,7 +50,7 @@ RUN HTDOCS=/tests/t/htdocs \
     && HASH2=$(openssl passwd -6 "otherpass") \
     && echo "otheruser:${HASH2}" >> "$HTDOCS/auth/.htpasswd" \
     # {SHA} format: base64(sha1(password)) \
-    && SHA_HASH=$(printf '%s' 'testpass' | sha1sum | awk '{print $1}' | xxd -r -p | base64) \
+    && SHA_HASH=$(printf '%s' 'testpass' | openssl dgst -sha1 -binary | base64) \
     && echo "shauser:{SHA}${SHA_HASH}" > "$HTDOCS/auth-sha/.htpasswd" \
     # $apr1$ format: Apache MD5 (htpasswd -m) \
     && htpasswd -bcm "$HTDOCS/auth-apr1/.htpasswd" apruser testpass \

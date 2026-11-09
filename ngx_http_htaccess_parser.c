@@ -9,10 +9,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Strip CR/LF from a string in-place - prevents HTTP response splitting
+ * Strip control characters from a string in-place: CR/LF would split the
+ * response, and RFC 9110 allows no other control byte (but HTAB) in a field
+ * value either.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static void
@@ -20,7 +23,7 @@ hta_strip_crlf(u_char *s, size_t *len)
 {
     u_char *r = s, *w = s, *end = s + *len;
     while (r < end) {
-        if (*r != '\r' && *r != '\n') *w++ = *r;
+        if ((*r >= 0x20 && *r != 0x7f) || *r == '\t') *w++ = *r;
         r++;
     }
     *w = '\0';
@@ -115,6 +118,14 @@ hta_regex_compile_budget(hta_parsed_t *h, ngx_regex_compile_t *rc,
         return NGX_ERROR;
     }
 
+    if (++h->nregex > HTA_MAX_REGEX_PER_FILE) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+            "htaccess: more than %d regular expressions in one file, "
+            "failing closed", HTA_MAX_REGEX_PER_FILE);
+        h->invalid = 1;
+        return NGX_ERROR;
+    }
+
     if (ngx_regex_compile(rc) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
             "htaccess: bad regex, failing closed");
@@ -148,19 +159,141 @@ hta_regex_compile_budget(hta_parsed_t *h, ngx_regex_compile_t *rc,
 }
 
 
+static ngx_http_request_t   *hta_regex_r;
+
 #if (NGX_PCRE2)
 static pcre2_match_context  *hta_match_ctx;
 static pcre2_match_data     *hta_match_data;
 static ngx_uint_t            hta_match_data_size;
 #endif
 
+
+ngx_http_request_t *
+hta_regex_enter(ngx_http_request_t *r)
+{
+    ngx_http_request_t *prev = hta_regex_r;
+
+    hta_regex_r = r;
+    return prev;
+}
+
+
+void
+hta_regex_leave(ngx_http_request_t *prev)
+{
+    hta_regex_r = prev;
+}
+
+
+hta_req_ctx_t *
+hta_req_ctx(ngx_http_request_t *r)
+{
+    hta_req_ctx_t *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_htaccess_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(hta_req_ctx_t));
+        if (ctx == NULL) {
+            return NULL;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_htaccess_module);
+    }
+
+    return ctx;
+}
+
+
+static uint64_t
+hta_now_ns(void)
+{
+    struct timespec ts;
+
+    (void) clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000 + (uint64_t) ts.tv_nsec;
+}
+
+
+static void
+hta_regex_over(ngx_http_request_t *r, hta_req_ctx_t *ctx, const char *why)
+{
+    if (!ctx->regex_over) {
+        ctx->regex_over = 1;
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "htaccess: request budget: %s (%ui regex matches, %uL ms), "
+            "failing closed", why, ctx->regex_count,
+            (uint64_t) (ctx->regex_ns / 1000000));
+    }
+}
+
+
+/*
+ * Work budget of a request beyond regex matches: condition evaluation,
+ * file tests and expansions are charged to the same time budget, and the
+ * bytes expansions allocate to a memory budget.  Without them, 8160
+ * "RewriteCond ... -f [OR]" per file in 16 nested directories cost about
+ * 2 s per request, and 8160 conditions each expanding %{QUERY_STRING} seven
+ * times grew a worker by 760 MB.
+ */
+uint64_t
+hta_work_start(void)
+{
+    return hta_regex_r != NULL ? hta_now_ns() : 0;
+}
+
+
+ngx_int_t
+hta_work_stop(uint64_t t0)
+{
+    hta_req_ctx_t *ctx;
+
+    if (hta_regex_r == NULL || t0 == 0) {
+        return NGX_OK;
+    }
+    ctx = hta_req_ctx(hta_regex_r->main);
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+    ctx->regex_ns += hta_now_ns() - t0;
+    if (ctx->regex_ns > (uint64_t) HTA_REGEX_BUDGET_MS * 1000000) {
+        hta_regex_over(hta_regex_r, ctx, "time budget exceeded");
+    }
+    return ctx->regex_over ? NGX_ERROR : NGX_OK;
+}
+
+
+ngx_int_t
+hta_work_alloc(size_t n)
+{
+    hta_req_ctx_t *ctx;
+
+    if (hta_regex_r == NULL) {
+        return NGX_OK;
+    }
+    ctx = hta_req_ctx(hta_regex_r->main);
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+    if (ctx->regex_over) {
+        return NGX_ERROR;
+    }
+    ctx->expand_bytes += n;
+    if (ctx->expand_bytes > HTA_EXPAND_BUDGET) {
+        hta_regex_over(hta_regex_r, ctx, "expansion memory budget exceeded");
+        return NGX_ERROR;
+    }
+    return NGX_OK;
+}
+
+
 ngx_int_t
 hta_regex_exec(ngx_regex_t *re, ngx_str_t *s, int *captures, ngx_uint_t size)
 {
 #if (NGX_PCRE2)
-    ngx_int_t   rc;
-    ngx_uint_t  i, n, pairs;
-    size_t     *ov;
+    ngx_int_t       rc;
+    ngx_uint_t      i, n, pairs;
+    size_t         *ov;
+    hta_req_ctx_t  *ctx = NULL;
+    uint64_t        t0 = 0;
 
     if (hta_match_ctx == NULL) {
         hta_match_ctx = pcre2_match_context_create(NULL);
@@ -173,8 +306,8 @@ hta_regex_exec(ngx_regex_t *re, ngx_str_t *s, int *captures, ngx_uint_t size)
          * enough for pathological backtracking to occupy a worker for
          * minutes; these limits turn that into a clean match error.
          */
-        (void) pcre2_set_match_limit(hta_match_ctx, 1000000);
-        (void) pcre2_set_depth_limit(hta_match_ctx, 1000);
+        (void) pcre2_set_match_limit(hta_match_ctx, HTA_REGEX_MATCH_LIMIT);
+        (void) pcre2_set_depth_limit(hta_match_ctx, HTA_REGEX_DEPTH_LIMIT);
     }
 
     if (hta_match_data == NULL || size > hta_match_data_size) {
@@ -190,14 +323,40 @@ hta_regex_exec(ngx_regex_t *re, ngx_str_t *s, int *captures, ngx_uint_t size)
         }
     }
 
+    if (hta_regex_r != NULL) {
+        ctx = hta_req_ctx(hta_regex_r->main);
+        if (ctx == NULL || ctx->regex_over) {
+            return HTA_REGEX_ERROR;
+        }
+        if (++ctx->regex_count > HTA_REGEX_MAX_EXEC) {
+            hta_regex_over(hta_regex_r, ctx, "regex count limit reached");
+            return HTA_REGEX_ERROR;
+        }
+        t0 = hta_now_ns();
+    }
+
     rc = pcre2_match((pcre2_code *) re, s->data, s->len, 0, 0,
                      hta_match_data, hta_match_ctx);
+
+    if (ctx != NULL) {
+        ctx->regex_ns += hta_now_ns() - t0;
+        if (ctx->regex_ns > (uint64_t) HTA_REGEX_BUDGET_MS * 1000000) {
+            hta_regex_over(hta_regex_r, ctx, "time budget exceeded");
+            return HTA_REGEX_ERROR;
+        }
+    }
 
     if (rc == PCRE2_ERROR_NOMATCH) {
         return NGX_REGEX_NO_MATCHED;
     }
 
     if (rc < 0) {
+        if (hta_regex_r != NULL && ctx != NULL) {
+            hta_regex_over(hta_regex_r, ctx,
+                           rc == PCRE2_ERROR_MATCHLIMIT
+                           || rc == PCRE2_ERROR_DEPTHLIMIT
+                           ? "regex match limit reached" : "regex match error");
+        }
         return HTA_REGEX_ERROR;
     }
 
@@ -1783,6 +1942,35 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
             h->exec_disabled = 1;
         }
 
+        /*
+         * An ini name is letters, digits, '_' and '.'.  Anything else lets a
+         * name pass the dangerous-settings check and still reach PHP as that
+         * setting: "auto_prepend_file " (PHP trims it) or
+         * "auto_prepend_file=/x;" (';' starts an INI comment) became
+         * auto_prepend_file=/x in PHP_VALUE.
+         */
+        if (is_known) {
+            u_char *np = args[1];
+            if (*np == '\0') {
+                is_known = 0;
+            }
+            for (; *np; np++) {
+                if (!((*np >= 'a' && *np <= 'z') || (*np >= 'A' && *np <= 'Z')
+                      || (*np >= '0' && *np <= '9') || *np == '_'
+                      || *np == '.'))
+                {
+                    is_known = 0;
+                    break;
+                }
+            }
+            if (!is_known) {
+                ngx_log_error(NGX_LOG_WARN, log, 0,
+                    "htaccess: ignoring %s with an invalid setting name",
+                    args[0]);
+                return;
+            }
+        }
+
         if (is_known && h->nphp_values < HTA_MAX_PHP_VALUES) {
             hta_php_value_t *pv = &h->php_values[h->nphp_values];
             pv->name.data  = args[1];
@@ -1796,8 +1984,7 @@ hta_parse_line(hta_parsed_t *h, u_char *line, ngx_uint_t len, ngx_log_t *log)
                 u_char    *vp = pv->value.data;
                 ngx_uint_t k;
                 for (k = 0; k < pv->value.len; k++) {
-                    if (vp[k] == '\n' || vp[k] == '\r'
-                        || vp[k] == '"'  || vp[k] == '\0')
+                    if (vp[k] < 0x20 || vp[k] == 0x7f || vp[k] == '"')
                         vp[k] = ' ';
                 }
             }
@@ -2023,6 +2210,7 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log,
     }
 
     h->mtime = ngx_file_mtime(&fi);
+    hta_fver_set(&h->fver, &fi);
     h->mem_size = sizeof(hta_parsed_t) + (size_t) sz + 4096;
 
     if (sz == 0) {
@@ -2313,6 +2501,16 @@ hta_parse_file(ngx_pool_t *pool, u_char *filepath, ngx_log_t *log,
                                     pe--;
                                 fb->pattern.data = ps;
                                 fb->pattern.len = (size_t) (pe - ps);
+                                if (fb->pattern.len == 0) {
+                                    /* <Files ""> matches nothing, so its
+                                     * access rules would silently not
+                                     * apply */
+                                    ngx_log_error(NGX_LOG_ERR, log, 0,
+                                        "htaccess: empty Files/FilesMatch "
+                                        "pattern, failing closed");
+                                    h->invalid = 1;
+                                    return h;
+                                }
 
                                 if (fb->is_regex && fb->pattern.len > 0) {
                                     ngx_regex_compile_t rc;

@@ -268,6 +268,35 @@ nginx variable lookup.
 - `ExpiresActive` state is merged root-to-leaf and the header is emitted once, so `ExpiresActive Off` in a child removes a parent-generated `Expires`/`Cache-Control` instead of leaving a stale value or duplicate.
 - `<Limit>` inside `<Files>`, nested `<Limit>/<Files>`, `<If>`/`<IfVersion>` and unknown blocks now fail closed rather than being silently skipped. (`<IfModule>` and `<IfModule !mod>` are still supported.)
 - Path/depth/candidate/header/auth-list caps fail closed (500) instead of silently dropping the overflowing security directives.
+- Customer regexes have a CPU budget per request: at most 50 ms of total match time and 4096 matches across every `RewriteRule`, `RewriteCond`, `<FilesMatch>`, `SetEnvIf`, `BrowserMatch` and `RedirectMatch` (plus a per-match limit of 100000 steps, depth 250), and at most 1024 patterns per file. Over a budget the request fails closed with 500 and one error line; before, 8192 patterns just under the per-match limit could keep a worker, and every site it serves, busy for minutes per request.
+- A regex or internal error in a phase handler answers 500 instead of dropping the connection without a log line.
+- `SetEnv`/`SetEnvIf`/`UnsetEnv`/`BrowserMatch` and the `[E=]` rewrite flag write only variables listed in `htaccess_env_allow` (default: none) that are declared with `set`. Before, `[E=]` could overwrite any variable, including `$remote_addr` (forged access logs, so fail2ban could be made to ban any address, and a forged `REMOTE_ADDR` for PHP), and `SetEnv` could rewrite an operator's own `set $var`, such as a `limit_conn` key (one customer could move their requests into another customer's connection limit, or out of every limit).
+- No control character but HTAB reaches a response or request header: static `Header`/`RequestHeader` values drop them at parse time, values built at run time (redirect targets, expanded headers) are refused or blanked (before, only CR, LF and NUL were).
+- `RequestHeader` cannot set `Host` (it added a second `Host` line, which upstreams reject).
+- `<Files "">` (an empty pattern, which matches nothing) fails closed instead of silently not applying its rules.
+- A missing, oversized, foreign-owned or out-of-root `AuthUserFile`/`AuthGroupFile` is logged with its path (it already failed closed).
+- Expanded values (`%{QUERY_STRING}`, `%{HTTP_USER_AGENT}`, `$N`, `%N`, ...) are never dropped for length: they grow up to 1 MB and beyond that the request fails closed. Before, any value over 4 KB vanished from the condition, so "deny if the query string contains union select" was skipped by adding a long parameter.
+- `php_value`/`php_flag` setting names must be `[A-Za-z0-9_.]`; names such as `"auto_prepend_file "` or `"auto_prepend_file=/x;"` slipped past the dangerous-settings list and still reached PHP as that setting. Control characters in values become spaces. `mail.force_extra_parameters`, `sendmail_path`, `user_ini.filename`, `opcache.file_cache` and `opcache.restrict_api` joined the dangerous list.
+- An inotify event invalidates every cache entry of its watch (one `.htaccess` reached through a directory symlink inside the root had a stale second entry), and permission/link changes (`IN_ATTRIB`) invalidate too.
+- `Options -Indexes` reads nginx's own `index` list on 1.31.x as well (it fell back to the default names).
+- Copies of paths kept for later in the request (an inherited `AuthUserFile`/`AuthGroupFile`) are NUL-terminated; they were read past their end as C strings.
+- Without inotify (NFS, watch limits) a changed `.htaccess` is recognised by mtime and ctime with nanoseconds, inode, device and size; mtime in whole seconds missed a second edit within the same second, so a just-added deny rule could stay unapplied.
+- The per-request budget covers all customer work, not only regex matches: condition evaluation, `RewriteCond` file tests and `%{VAR}`/`$N` expansions share one time budget (50 ms) and expansions share a 4 MB memory budget. Without it, 8160 `-f` conditions across 16 nested directories cost about 2 s of a worker per request, and 8160 conditions each expanding `%{QUERY_STRING}` seven times grew a worker by ~760 MB; both now end at the budget with 500.
+- `t/24-tenant-limits.t.sh` covers all of the above; a mutation fuzzer ran 19000 `.htaccess` variants against ASan builds of 1.30.6 and 1.31.8 without a crash.
+
+### Overhead
+
+Measured on a real WordPress 6 site (51 posts, Yoast SEO, PHP 8.5-FPM) with a 38-line `.htaccess` (the WordPress block, `<FilesMatch>` denies, security headers, `Expires`), module on vs off, same nginx and backend:
+
+| Request | Module off | Module on | Added |
+|---------|-----------|-----------|-------|
+| static file, warm cache (per request) | 0.064 ms | 0.086 ms | ~0.022 ms |
+| dynamic WP page (index.php) | ~55 ms | ~55 ms | within noise |
+| static file, each of 8 nested directories has its own `.htaccess` | - | +~0.007 ms per level | - |
+| static file, 128-condition `.htaccess` | - | 0.091 ms | - |
+
+Worker RSS was unchanged (about 11 MB) and flat over 100000 requests (no per-request leak). The parsed-`.htaccess` cache is per worker and bounded by `HTA_CACHE_MAX_BYTES` (64 MB); it holds the compiled rules and PCRE2 programs, evicting least-recently-used entries past the budget. The per-request cost is the directory walk that stats one `.htaccess` per level plus the cached rules; parsing happens once per file and is then cached.
+- Operators: `%{ENV:name}`, `%{name}` and `SetEnvIf` read nginx variables by name, so do not keep secrets in nginx variables of locations where `.htaccess` is on.
 - Cross-tenant regression coverage: `t/23-hardening.t.sh` creates two Unix owners and verifies symlinked directory escapes, hardlinked/symlinked `.htaccess`, and an `AuthUserFile` pointing at the other tenant are all rejected.
 
 ## Installation
@@ -334,17 +363,23 @@ yum install gcc make pcre-devel zlib-devel openssl-devel
 
 ### Tested nginx versions
 
-The test suite is exercised against three nginx releases per CI run:
+The test suite is run against these nginx releases, each also under ASan/UBSan where marked:
 
 | Version | Status |
 |---------|--------|
-| 1.24.0 (oldest supported) | All 166 tests pass |
-| 1.28.2 (default in Dockerfile) | All 166 tests pass |
-| 1.30.3 (latest stable) | All 166 tests pass |
+| 1.24.0 (oldest supported) | All tests pass |
+| 1.26.3 (Debian 13 package version) | All tests pass, on Ubuntu 26.04 and Debian 13 |
+| 1.28.3 (Ubuntu 26.04 package version) | All tests pass |
+| 1.30.6 (stable, default in Dockerfile) | All tests pass, also under ASan/UBSan, on Ubuntu 26.04 and Debian 13 |
+| 1.31.8 (mainline) | All tests pass, also under ASan/UBSan |
+
+Also run: the whole suite with `openat2` refused (kernels before 5.6), with `inotify` refused (NFS, watch limits) and with `pcre_jit on`; a 5-minute soak with 8 workers, mixed traffic, 782 `.htaccess` edits (every edit checked on all workers at once) and 10 reloads; HTTP/2 (`h2load`, 600000 multiplexed requests) and HTTP/3; and a real WordPress site, whose 43 test requests (pages, REST API, login and dashboard, sitemaps, feeds, denied files, caching, bot blocking) answer exactly as the equivalent hand-written nginx configuration.
 
 Override the version at build time:
 ```bash
-docker build --build-arg NGINX_VERSION=1.30.3 -t nginx-htaccess-test:1.30.3 .
+docker build --build-arg NGINX_VERSION=1.31.8 \
+  --build-arg NGINX_SHA256=0652b760b3b772d2ec17b47c2fc15d9a95e6fe35cd5b877eadc1a62d9bc75af1 \
+  -t nginx-htaccess-test:1.31.8 .
 ```
 
 ## Configuration
@@ -404,6 +439,7 @@ http {
 | `htaccess_allow_proxy_headers` | http, server, location | `off` | Allow `RequestHeader` to forge `X-Forwarded-*`/`Forwarded`/`X-Real-IP` |
 | `htaccess_allow_security_unset` | http, server, location | `off` | Allow `Header unset` of security headers set by a parent scope |
 | `htaccess_trust_proxy` | http, server, location | `off` | Trust `X-Forwarded-Proto` for `SSLRequireSSL` (enable only when nginx sits behind a TLS-terminating proxy that overwrites the header) |
+| `htaccess_env_allow` | http, server, location | none | Variables `SetEnv`, `SetEnvIf`, `UnsetEnv`, `BrowserMatch` and `[E=]` may write: names, or prefixes ending in `*`; `*` alone allows every variable declared with `set` (single-tenant only). The variable must also be declared with `set` |
 
 ## Architecture
 

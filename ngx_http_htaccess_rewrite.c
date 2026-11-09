@@ -9,6 +9,13 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#if defined(__linux__) && __has_include(<linux/openat2.h>)
+#include <linux/openat2.h>
+#endif
 
 
 /* defined later in this file - used by %{HTTP:Header} expansion */
@@ -16,14 +23,26 @@ static ngx_table_elt_t *hta_find_req_header(ngx_http_request_t *r,
     ngx_str_t *name);
 static ngx_int_t hta_internal_redirect(ngx_http_request_t *r,
     ngx_str_t *uri, ngx_str_t *args);
+static void hta_assign_env(ngx_http_request_t *r, ngx_str_t *name,
+    ngx_str_t *value, unsigned do_unset);
 
-/* Untrusted values must never put CR/LF/NUL into a header or internal URI. */
+/*
+ * Untrusted values must never put a control character into a header or an
+ * internal URI: CR/LF/NUL split or truncate it, and RFC 9110 forbids every
+ * other control byte but HTAB in a field value (VT, FF, ESC, DEL, ...).
+ */
+static ngx_inline ngx_int_t
+hta_ctl_byte(u_char c)
+{
+    return (c < 0x20 && c != '\t') || c == 0x7f;
+}
+
 static ngx_int_t
 hta_value_has_crlf(ngx_str_t *s)
 {
     size_t i;
     for (i = 0; i < s->len; i++) {
-        if (s->data[i] == '\r' || s->data[i] == '\n' || s->data[i] == '\0') {
+        if (hta_ctl_byte(s->data[i])) {
             return 1;
         }
     }
@@ -35,7 +54,7 @@ hta_value_sanitize(ngx_str_t *s)
 {
     size_t i;
     for (i = 0; i < s->len; i++) {
-        if (s->data[i] == '\r' || s->data[i] == '\n' || s->data[i] == '\0') {
+        if (hta_ctl_byte(s->data[i])) {
             s->data[i] = ' ';
         }
     }
@@ -73,10 +92,14 @@ hta_path_inside_root(ngx_http_request_t *r, ngx_str_t *path)
         return 0;
     }
 
-    if (realpath((char *) clcf->root.data, root) == NULL) {
-        return 0;
+    {
+        ngx_str_t rr;
+        if (hta_root_real(r, &rr) != NGX_OK || rr.len >= sizeof(root)) {
+            return 0;
+        }
+        ngx_memcpy(root, rr.data, rr.len + 1);
+        rlen = rr.len;
     }
-    rlen = ngx_strlen(root);
 
     /*
      * Keep file tests inside the document root.  Without this, a customer
@@ -104,6 +127,125 @@ hta_path_inside_root(ngx_http_request_t *r, ngx_str_t *path)
     return (n == rlen || resolved[rlen] == '/');
 }
 
+/*
+ * stat() for RewriteCond file tests, confined to the document root and
+ * without a check-then-use race: openat2(RESOLVE_BENEATH) from the root
+ * resolves the whole path in one step and refuses to leave the root (Linux
+ * 5.6+), so a directory swapped for a symlink cannot reach another tenant.
+ * The root is resolved and opened once per request.  On kernels without
+ * openat2 the realpath() check of hta_path_inside_root() is used.
+ * Returns 0 when the path exists inside the root, -1 otherwise.
+ */
+static void
+hta_close_fd(void *data)
+{
+    (void) close(*(int *) data);
+}
+
+#if defined(SYS_openat2) && defined(RESOLVE_BENEATH)
+static ngx_uint_t hta_no_openat2;
+
+static ngx_int_t
+hta_root_fd(ngx_http_request_t *r, ngx_str_t *rr, int *fd)
+{
+    hta_req_ctx_t       *ctx;
+    ngx_pool_cleanup_t  *cln;
+    int                  f;
+
+    if (hta_root_real(r, rr) != NGX_OK) return NGX_ERROR;
+    ctx = hta_req_ctx(r);
+    if (ctx == NULL) return NGX_ERROR;
+
+    if (!ctx->root_fd_set) {
+        cln = ngx_pool_cleanup_add(r->pool, sizeof(int));
+        if (cln == NULL) return NGX_ERROR;
+        f = open((char *) rr->data, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (f == -1) return NGX_ERROR;
+        *(int *) cln->data = f;
+        cln->handler = hta_close_fd;
+        ctx->root_fd = f;
+        ctx->root_fd_set = 1;
+    }
+
+    *fd = ctx->root_fd;
+    return NGX_OK;
+}
+#endif
+
+static ngx_int_t
+hta_confined_stat(ngx_http_request_t *r, ngx_str_t *path, struct stat *st,
+    ngx_uint_t nofollow)
+{
+#if defined(SYS_openat2) && defined(RESOLVE_BENEATH)
+    ngx_http_core_loc_conf_t *clcf;
+    ngx_str_t                 rr;
+    u_char                    rel[HTA_MAX_PATH];
+    const u_char             *p;
+    size_t                    len, clen;
+    int                       rootfd, fd;
+    struct open_how           how;
+
+    if (hta_no_openat2) goto plain;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf == NULL || clcf->root.len == 0
+        || hta_root_fd(r, &rr, &rootfd) != NGX_OK)
+    {
+        return -1;
+    }
+
+    p = path->data;
+    len = path->len;
+    if (len > 0 && p[0] == '/') {
+        /* absolute: must start with the real or the configured root */
+        clen = clcf->root.len;
+        while (clen > 1 && clcf->root.data[clen - 1] == '/') clen--;
+        if (len >= rr.len && ngx_memcmp(p, rr.data, rr.len) == 0
+            && (len == rr.len || p[rr.len] == '/' || rr.len == 1))
+        {
+            p += rr.len; len -= rr.len;
+        } else if (len >= clen && ngx_memcmp(p, clcf->root.data, clen) == 0
+                   && (len == clen || p[clen] == '/'))
+        {
+            p += clen; len -= clen;
+        } else {
+            return -1;
+        }
+    }
+    while (len > 0 && *p == '/') { p++; len--; }
+    if (len >= sizeof(rel)) return -1;
+    if (len == 0) {
+        rel[0] = '.'; rel[1] = '\0';
+    } else {
+        ngx_memcpy(rel, p, len);
+        rel[len] = '\0';
+    }
+
+    ngx_memzero(&how, sizeof(how));
+    how.flags = O_PATH | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0);
+    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+    fd = (int) syscall(SYS_openat2, rootfd, (char *) rel, &how, sizeof(how));
+    if (fd == -1) {
+        if (errno == ENOSYS) {
+            hta_no_openat2 = 1;
+            goto plain;
+        }
+        return -1;
+    }
+    if (fstat(fd, st) == -1) {
+        (void) close(fd);
+        return -1;
+    }
+    (void) close(fd);
+    return 0;
+
+plain:
+#endif
+    if (!hta_path_inside_root(r, path)) return -1;
+    return nofollow ? lstat((char *) path->data, st)
+                    : stat((char *) path->data, st);
+}
+
 static ngx_int_t
 hta_uri_has_dotdot(ngx_str_t *s)
 {
@@ -122,6 +264,67 @@ hta_uri_has_dotdot(ngx_str_t *s)
 }
 
 
+/*
+ * Growing output buffer for expansions.  A value that did not fit used to be
+ * dropped silently, so "RewriteCond %{QUERY_STRING} union.*select" saw an
+ * empty string for any query string over 4 KB and the deny rule was skipped.
+ * Now the buffer grows (in r->pool) up to HTA_MAX_EXPAND, and past that the
+ * expansion fails, which fails the request closed.
+ */
+#define HTA_MAX_EXPAND  (1024 * 1024)
+
+typedef struct {
+    ngx_pool_t  *pool;
+    u_char      *data;
+    size_t       len;
+    size_t       cap;
+} hta_buf_t;
+
+static ngx_int_t
+hta_buf_init(hta_buf_t *b, ngx_pool_t *pool, size_t hint)
+{
+    b->pool = pool;
+    b->len = 0;
+    b->cap = hint + 64;
+    if (hta_work_alloc(b->cap) != NGX_OK) return NGX_ERROR;
+    b->data = ngx_pnalloc(pool, b->cap);
+    return b->data ? NGX_OK : NGX_ERROR;
+}
+
+static ngx_int_t
+hta_buf_put(hta_buf_t *b, const u_char *s, size_t n)
+{
+    u_char *nd;
+    size_t  ncap;
+
+    if (n > HTA_MAX_EXPAND || b->len + n + 1 > HTA_MAX_EXPAND) {
+        return NGX_ERROR;
+    }
+    if (b->len + n + 1 > b->cap) {
+        ncap = b->cap * 2;
+        if (ncap < b->len + n + 1) ncap = b->len + n + 1;
+        if (ncap > HTA_MAX_EXPAND) ncap = HTA_MAX_EXPAND;
+        if (hta_work_alloc(ncap) != NGX_OK) return NGX_ERROR;
+        nd = ngx_pnalloc(b->pool, ncap);
+        if (nd == NULL) return NGX_ERROR;
+        ngx_memcpy(nd, b->data, b->len);
+        b->data = nd;
+        b->cap = ncap;
+    }
+    ngx_memcpy(b->data + b->len, s, n);
+    b->len += n;
+    return NGX_OK;
+}
+
+static void
+hta_buf_done(hta_buf_t *b, ngx_str_t *dst)
+{
+    b->data[b->len] = '\0';
+    dst->data = b->data;
+    dst->len = b->len;
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Variable expansion - %{VAR_NAME}
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -129,11 +332,12 @@ hta_uri_has_dotdot(ngx_str_t *s)
 ngx_int_t
 hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst)
 {
-    u_char  res[HTA_MAX_PATH];
-    u_char *p = src->data, *end = src->data + src->len, *d = res;
-    ngx_uint_t rlen = 0;
+    u_char    *p = src->data, *end = src->data + src->len;
+    hta_buf_t  out;
 
-    while (p < end && rlen < HTA_MAX_PATH - 1) {
+    if (hta_buf_init(&out, r->pool, src->len) != NGX_OK) return NGX_ERROR;
+
+    while (p < end) {
         if (*p == '%' && p + 1 < end && *(p+1) == '{') {
             u_char    *vs;
             ngx_uint_t vlen;
@@ -345,20 +549,16 @@ nginx_var_fallback:
                 }
             }
 
-            if (val.len > 0 && rlen + val.len < HTA_MAX_PATH - 1) {
-                ngx_memcpy(d, val.data, val.len);
-                d += val.len; rlen += val.len;
+            if (val.len > 0 && hta_buf_put(&out, val.data, val.len) != NGX_OK) {
+                return NGX_ERROR;
             }
         } else {
-            *d++ = *p++; rlen++;
+            if (hta_buf_put(&out, p, 1) != NGX_OK) return NGX_ERROR;
+            p++;
         }
     }
 
-    *d = '\0';
-    dst->data = ngx_pnalloc(r->pool, rlen + 1);
-    if (dst->data == NULL) return NGX_ERROR;
-    ngx_memcpy(dst->data, res, rlen + 1);
-    dst->len = rlen;
+    hta_buf_done(&out, dst);
     return NGX_OK;
 }
 
@@ -390,11 +590,11 @@ hta_expand_full(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst,
     hta_backref_t *br)
 {
     u_char    *p = src->data, *end = src->data + src->len;
-    u_char     res[HTA_MAX_PATH];
-    u_char    *d = res;
-    ngx_uint_t rlen = 0;
+    hta_buf_t  out;
 
-    while (p < end && rlen < HTA_MAX_PATH - 1) {
+    if (hta_buf_init(&out, r->pool, src->len) != NGX_OK) return NGX_ERROR;
+
+    while (p < end) {
         if (*p == '$' && p + 1 < end && *(p+1) >= '0' && *(p+1) <= '9'
             && br && br->have_rule)
         {
@@ -403,10 +603,10 @@ hta_expand_full(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst,
             if (n < br->rule_ncaps / 2) {
                 int s = br->rule_caps[n*2], e = br->rule_caps[n*2+1];
                 if (s >= 0 && e >= s) {
-                    ngx_uint_t blen = e - s;
-                    if (rlen + blen < HTA_MAX_PATH - 1) {
-                        ngx_memcpy(d, br->rule_subject.data + s, blen);
-                        d += blen; rlen += blen;
+                    if (hta_buf_put(&out, br->rule_subject.data + s,
+                                    (size_t) (e - s)) != NGX_OK)
+                    {
+                        return NGX_ERROR;
                     }
                 }
             }
@@ -418,10 +618,10 @@ hta_expand_full(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst,
             if (n < br->cond_ncaps / 2) {
                 int s = br->cond_caps[n*2], e = br->cond_caps[n*2+1];
                 if (s >= 0 && e >= s) {
-                    ngx_uint_t blen = e - s;
-                    if (rlen + blen < HTA_MAX_PATH - 1) {
-                        ngx_memcpy(d, br->cond_subject.data + s, blen);
-                        d += blen; rlen += blen;
+                    if (hta_buf_put(&out, br->cond_subject.data + s,
+                                    (size_t) (e - s)) != NGX_OK)
+                    {
+                        return NGX_ERROR;
                     }
                 }
             }
@@ -431,22 +631,18 @@ hta_expand_full(ngx_http_request_t *r, ngx_str_t *src, ngx_str_t *dst,
             while (p < end && *p != '}') p++;
             if (p < end) p++;
             vref.data = vstart; vref.len = p - vstart;
-            if (hta_expand_vars(r, &vref, &exp) == NGX_OK && exp.len > 0) {
-                if (rlen + exp.len < HTA_MAX_PATH - 1) {
-                    ngx_memcpy(d, exp.data, exp.len);
-                    d += exp.len; rlen += exp.len;
-                }
+            if (hta_expand_vars(r, &vref, &exp) != NGX_OK
+                || (exp.len > 0 && hta_buf_put(&out, exp.data, exp.len) != NGX_OK))
+            {
+                return NGX_ERROR;
             }
         } else {
-            *d++ = *p++; rlen++;
+            if (hta_buf_put(&out, p, 1) != NGX_OK) return NGX_ERROR;
+            p++;
         }
     }
 
-    *d = '\0';
-    dst->data = ngx_pnalloc(r->pool, rlen + 1);
-    if (dst->data == NULL) return NGX_ERROR;
-    ngx_memcpy(dst->data, res, rlen + 1);
-    dst->len = rlen;
+    hta_buf_done(&out, dst);
     return NGX_OK;
 }
 
@@ -483,6 +679,7 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule, hta_backref_t *br,
     ngx_int_t  final_result = 1;
     ngx_int_t  group_result = 0;
     unsigned   in_or_group = 0;
+    uint64_t   t0;
 
     if (rule->nconds == 0) return NGX_OK;
 
@@ -494,6 +691,9 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule, hta_backref_t *br,
 
         c = &rule->conds[i];
         match = 0;
+        /* regex conditions are timed inside hta_regex_exec(); the rest
+         * (expansion, comparisons, file tests) is timed here */
+        t0 = (c->test_type == HTA_TEST_REGEX) ? 0 : hta_work_start();
         /* expand %{VAR} and, since the rule pattern was matched first, $N
          * backreferences from the rule (e.g. CodeIgniter "RewriteCond $1 ...") */
         if (hta_expand_full(r, &c->test_string, &expanded, br) != NGX_OK)
@@ -529,38 +729,33 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule, hta_backref_t *br,
             }
             break;
         case HTA_TEST_FILE: {
-            ngx_file_info_t fi;
-            /* Security: reject path traversal in file tests */
-            if (!hta_path_inside_root(r, &expanded)) break;
-            match = (ngx_file_info(expanded.data, &fi) == 0
-                     && ngx_is_file(&fi));
+            struct stat st;
+            /* confined to the document root, see hta_confined_stat() */
+            match = (hta_confined_stat(r, &expanded, &st, 0) == 0
+                     && S_ISREG(st.st_mode));
             break;
         }
         case HTA_TEST_DIR: {
-            ngx_file_info_t fi;
-            if (!hta_path_inside_root(r, &expanded)) break;
-            match = (ngx_file_info(expanded.data, &fi) == 0
-                     && ngx_is_dir(&fi));
+            struct stat st;
+            match = (hta_confined_stat(r, &expanded, &st, 0) == 0
+                     && S_ISDIR(st.st_mode));
             break;
         }
         case HTA_TEST_LINK: {
             struct stat st;
-            if (!hta_path_inside_root(r, &expanded)) break;
-            match = (lstat((char *)expanded.data, &st) == 0
+            match = (hta_confined_stat(r, &expanded, &st, 1) == 0
                      && S_ISLNK(st.st_mode));
             break;
         }
         case HTA_TEST_EXISTS: {
-            ngx_file_info_t fi;
-            if (!hta_path_inside_root(r, &expanded)) break;
-            match = (ngx_file_info(expanded.data, &fi) == 0);
+            struct stat st;
+            match = (hta_confined_stat(r, &expanded, &st, 0) == 0);
             break;
         }
         case HTA_TEST_SIZE: {
-            ngx_file_info_t fi;
-            if (!hta_path_inside_root(r, &expanded)) break;
-            match = (ngx_file_info(expanded.data, &fi) == 0
-                     && ngx_file_size(&fi) > 0);
+            struct stat st;
+            match = (hta_confined_stat(r, &expanded, &st, 0) == 0
+                     && st.st_size > 0);
             break;
         }
         case HTA_TEST_STR_EQ:
@@ -598,6 +793,10 @@ hta_eval_conds(ngx_http_request_t *r, hta_rule_t *rule, hta_backref_t *br,
             }
             break;
         }
+        }
+
+        if (hta_work_stop(t0) != NGX_OK) {
+            return NGX_ERROR;
         }
 
         if (c->flags & HTA_CF_NEGATE) match = !match;
@@ -859,34 +1058,40 @@ hta_apply_rules(ngx_http_request_t *r, hta_parsed_t *h)
 
         /* === matched === */
 
-        /* apply [E=key:val] flag - set nginx variable */
+        /* apply [E=key:val] flag - set an nginx variable, under the same
+         * rules as SetEnv (htaccess_env_allow, changeable variables only):
+         * writing $remote_addr or a limit key from .htaccess forged logs,
+         * PHP's REMOTE_ADDR and other tenants' limits */
         if (rule->flags & HTA_F_ENV && rule->env_key.len > 0) {
-            ngx_str_t vname;
-            vname.len = rule->env_key.len;
-            vname.data = ngx_pnalloc(r->pool, vname.len);
-            if (vname.data) {
-                ngx_uint_t                 k;
-                ngx_uint_t                 hash;
-                ngx_http_variable_value_t *vv;
-
-                for (k = 0; k < vname.len; k++)
-                    vname.data[k] = ngx_tolower(rule->env_key.data[k]);
-                hash = ngx_hash_key(vname.data, vname.len);
-                vv = ngx_http_get_variable(r, &vname, hash);
-                if (vv) {
-                    /* the E= value may reference %{VAR}/$N/%N, e.g.
-                     * [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}] */
-                    ngx_str_t ev;
-                    if (hta_expand_full(r, &rule->env_val, &ev, &br) != NGX_OK
-                        && hta_pstrdup(r, &ev, &rule->env_val) != NGX_OK)
+            /* the E= value may reference %{VAR}/$N/%N, e.g.
+             * [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}] */
+            ngx_str_t ev;
+            if (hta_expand_full(r, &rule->env_val, &ev, &br) != NGX_OK
+                && hta_pstrdup(r, &ev, &rule->env_val) != NGX_OK)
+            {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            hta_value_sanitize(&ev);
+            hta_assign_env(r, &rule->env_key, &ev, 0);
+            {
+                hta_req_ctx_t *ctx = hta_req_ctx(r);
+                ngx_str_t     *kv;
+                if (ctx != NULL && ctx->env_late == NULL) {
+                    ctx->env_late = ngx_array_create(r->pool, 4,
+                                                     2 * sizeof(ngx_str_t));
+                }
+                if (ctx != NULL && ctx->env_late != NULL
+                    && ctx->env_late->nelts < HTA_MAX_RULES)
+                {
+                    /* copies in r->pool: the cached rule may be evicted
+                     * before the preaccess phase runs */
+                    kv = ngx_array_push(ctx->env_late);
+                    if (kv != NULL
+                        && (hta_pstrdup(r, &kv[0], &rule->env_key) != NGX_OK
+                            || hta_pstrdup(r, &kv[1], &ev) != NGX_OK))
                     {
-                        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                        ctx->env_late->nelts--;
                     }
-                    vv->data = ev.data;
-                    vv->len = ev.len;
-                    vv->valid = 1;
-                    vv->not_found = 0;
-                    vv->no_cacheable = 0;
                 }
             }
         }
@@ -1166,6 +1371,37 @@ hta_check_errdoc(ngx_http_request_t *r, hta_errdoc_t *errdocs,
  * On set, env_value is the new value; on unset, the variable is marked
  * not_found so consumers see it as absent (matching Apache UnsetEnv).
  */
+static ngx_int_t
+hta_env_allowed(ngx_http_request_t *r, ngx_str_t *lname)
+{
+    ngx_http_hta_loc_conf_t  *lcf;
+    ngx_str_t                *a;
+    ngx_uint_t                i;
+
+    lcf = ngx_http_get_module_loc_conf(r, ngx_http_htaccess_module);
+    if (lcf == NULL || lcf->env_allow == NULL) {
+        return 0;
+    }
+
+    a = lcf->env_allow->elts;
+    for (i = 0; i < lcf->env_allow->nelts; i++) {
+        if (a[i].len > 0 && a[i].data[a[i].len - 1] == '*') {
+            if (lname->len >= a[i].len - 1
+                && ngx_strncasecmp(lname->data, a[i].data, a[i].len - 1) == 0)
+            {
+                return 1;
+            }
+        } else if (a[i].len == lname->len
+                   && ngx_strncasecmp(lname->data, a[i].data, a[i].len) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 static void
 hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
     unsigned do_unset)
@@ -1187,6 +1423,20 @@ hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
     hash = ngx_hash_key(lname.data, lname.len);
 
     /*
+     * The operator lists what .htaccess may write (htaccess_env_allow).  A
+     * changeable variable is not enough: "set $acct <uid>; limit_conn ...
+     * $acct" in a site's server block would let the customer move their
+     * requests into another account's limit, or out of every limit.
+     */
+    /* INFO, not WARN: stock CMS files (WordPress, Joomla, Laravel) set
+     * [E=HTTP_AUTHORIZATION:...] on every request */
+    if (!hta_env_allowed(r, &lname)) {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+            "htaccess: variable \"%V\" is not in htaccess_env_allow", &lname);
+        return;
+    }
+
+    /*
      * Only variables explicitly declared with set/map/changeable are safe
      * to overwrite.  Apache env vars live in a separate namespace; writing
      * $host/$request_uri/$https from .htaccess would let a customer affect
@@ -1195,7 +1445,7 @@ hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
     cmcf = ngx_http_get_module_main_conf(r, ngx_http_core_module);
     var = ngx_hash_find(&cmcf->variables_hash, hash, lname.data, lname.len);
     if (var == NULL || !(var->flags & NGX_HTTP_VAR_CHANGEABLE)) {
-        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
             "htaccess: refusing to overwrite nginx variable \"%V\"", &lname);
         return;
     }
@@ -1216,6 +1466,25 @@ hta_assign_env(ngx_http_request_t *r, ngx_str_t *name, ngx_str_t *value,
         vv->valid = 1;
         vv->not_found = 0;
         vv->no_cacheable = 0;
+    }
+}
+
+
+void
+hta_apply_late_env(ngx_http_request_t *r)
+{
+    hta_req_ctx_t *ctx;
+    ngx_str_t     *kv;
+    ngx_uint_t     i;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_htaccess_module);
+    if (ctx == NULL || ctx->env_late == NULL) {
+        return;
+    }
+
+    kv = ctx->env_late->elts;
+    for (i = 0; i < ctx->env_late->nelts; i++) {
+        hta_assign_env(r, &kv[2 * i], &kv[2 * i + 1], 0);
     }
 }
 
@@ -1511,6 +1780,20 @@ hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
             continue;
         }
 
+        /*
+         * Host selects the virtual server and is what upstreams trust for
+         * the site name; a second Host line (RequestHeader add/set appends
+         * to the list) makes upstreams answer 400.  Never set it from
+         * .htaccess.
+         */
+        if (hd->action != HTA_HDR_UNSET && name.len == 4
+            && ngx_strncasecmp(name.data, (u_char *) "host", 4) == 0)
+        {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "htaccess: refusing to set request header \"Host\"");
+            continue;
+        }
+
         if (hd->action != HTA_HDR_UNSET
             && (lcf == NULL || !lcf->allow_proxy_headers)
             && hta_proxy_header(&name))
@@ -1525,7 +1808,7 @@ hta_apply_request_headers(ngx_http_request_t *r, hta_parsed_t *h)
 
         if (hta_value_has_crlf(&value)) {
             ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                "htaccess: sanitizing CR/LF in RequestHeader value");
+                "htaccess: sanitizing control characters in RequestHeader value");
             hta_value_sanitize(&value);
         }
 

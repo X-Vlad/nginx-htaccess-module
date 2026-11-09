@@ -3,7 +3,7 @@
 ## Project
 
 Native C module for nginx that adds Apache `.htaccess` support. Linux only
-(inotify, crypt, lstat). Tested on nginx 1.24.0, 1.28.2, 1.30.3.
+(inotify, crypt, lstat). Tested on nginx 1.24.0, 1.30.6 (stable), 1.31.8 (mainline).
 
 ## Build
 
@@ -13,7 +13,7 @@ docker build -t nginx-htaccess-test .
 docker run --rm nginx-htaccess-test
 
 # Native (requires nginx source)
-make build NGINX_VERSION=1.30.3
+make build NGINX_VERSION=1.30.6
 make test
 ```
 
@@ -54,8 +54,31 @@ cd demo && ./demo.sh                                          # interactive demo
 - Direct access to any `.ht*` basename -> 403 (incl. backups like `.htpasswd.bak`)
 - File-size cap: 1 MB on `.htaccess` / `.htpasswd` / `.htgroup`
 - `Require group` inside `<Files>` / `<Limit>` IS propagated (bypass class)
-- CR/LF stripped from `Header` and `RequestHeader` values at parse time;
-  runtime-expanded redirect/header values are checked for CR/LF/NUL too
+- Control characters (all but HTAB) stripped from `Header` and
+  `RequestHeader` values at parse time; runtime-expanded redirect/header
+  values are refused or blanked when they hold one; `RequestHeader` never
+  sets `Host`
+- Every customer regex goes through `hta_regex_exec`, which charges the
+  request's budget (`HTA_REGEX_BUDGET_MS`, `HTA_REGEX_MAX_EXEC`) on top of the
+  per-match limits; at most `HTA_MAX_REGEX_PER_FILE` patterns per file. A new
+  entry point (phase handler, filter, variable) must wrap its body in
+  `hta_regex_enter`/`hta_regex_leave`, and a phase handler never returns
+  `NGX_ERROR` (nginx drops the connection silently): return 500
+- One per-request budget (`HTA_REGEX_BUDGET_MS` time, `HTA_EXPAND_BUDGET`
+  memory) covers every customer-controlled cost: regex matches
+  (`hta_regex_exec`), and non-regex work wrapped in
+  `hta_work_start`/`hta_work_stop` (condition eval, file tests) or
+  `hta_work_alloc` (expansion buffers). New per-request loops over customer
+  input must charge one of them, or a cheap directive repeated thousands of
+  times is a new DoS
+- Expansions use the growing `hta_buf_t` and fail (500) past 1 MB; never
+  drop a value that does not fit, a deny rule would then see an empty string
+- `php_value` names are `[A-Za-z0-9_.]` only, checked before the dangerous
+  list (PHP trims and parses INI syntax, so a name with a space, '=' or ';'
+  is another setting in disguise)
+- `.htaccess` writes nginx variables (SetEnv*, BrowserMatch, `[E=]`) only
+  through `hta_assign_env`, which allows only names in `htaccess_env_allow`
+  that are declared with `set`; never write a variable any other way
 - All header lookups use `ngx_strncasecmp` (case-insensitive)
 - `htaccess_strict` defaults to **on**: parse errors, invalid regexes, unknown
   directives/blocks, unreadable/oversized files and malformed tags fail closed

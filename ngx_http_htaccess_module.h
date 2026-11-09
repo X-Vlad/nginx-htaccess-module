@@ -42,8 +42,58 @@
 #define HTA_MAX_TOKENS        64
 #define HTA_MAX_REGEX_LEN     4096
 #define HTA_REGEX_MAX_BYTES   (8 * 1024 * 1024)
+
+/*
+ * CPU limits for customer regexes (shared hosting: one tenant must not be
+ * able to occupy a worker that serves every other tenant).
+ *   - per match: PCRE2 match and depth limits;
+ *   - per request: total time and number of matches across every rule,
+ *     condition, FilesMatch, SetEnvIf and RedirectMatch, after which the
+ *     request fails closed with 500;
+ *   - per file: number of compiled patterns (refused at parse time).
+ * A request that walks every pattern of a maximal file at the per-match
+ * limit stops after HTA_REGEX_BUDGET_MS instead of running for minutes.
+ */
+#define HTA_REGEX_MATCH_LIMIT 100000
+#define HTA_REGEX_DEPTH_LIMIT 250
+#define HTA_REGEX_BUDGET_MS   50
+#define HTA_REGEX_MAX_EXEC    4096
+#define HTA_MAX_REGEX_PER_FILE 1024
+/* bytes all expansions of one request may allocate */
+#define HTA_EXPAND_BUDGET     (4 * 1024 * 1024)
 #define HTA_CACHE_MAX_BYTES   (64 * 1024 * 1024)
 #define HTA_PASSWD_MAX_BYTES  (32 * 1024 * 1024)
+
+/*
+ * What identifies one version of a file when inotify is not available (NFS,
+ * watch limits): mtime in seconds alone missed two edits within the same
+ * second, so a deny rule added right after another change was never seen.
+ */
+typedef struct {
+    time_t   mtime_sec;
+    long     mtime_nsec;
+    time_t   ctime_sec;
+    long     ctime_nsec;
+    ino_t    ino;
+    dev_t    dev;
+    off_t    size;
+} hta_fver_t;
+
+#define hta_fver_set(v, st)                                                   \
+    do {                                                                      \
+        (v)->mtime_sec = (st)->st_mtim.tv_sec;                                \
+        (v)->mtime_nsec = (st)->st_mtim.tv_nsec;                              \
+        (v)->ctime_sec = (st)->st_ctim.tv_sec;                                \
+        (v)->ctime_nsec = (st)->st_ctim.tv_nsec;                              \
+        (v)->ino = (st)->st_ino;                                              \
+        (v)->dev = (st)->st_dev;                                              \
+        (v)->size = (st)->st_size;                                            \
+    } while (0)
+
+#define hta_fver_eq(a, b)                                                     \
+    ((a)->mtime_sec == (b)->mtime_sec && (a)->mtime_nsec == (b)->mtime_nsec  \
+     && (a)->ctime_sec == (b)->ctime_sec && (a)->ctime_nsec == (b)->ctime_nsec \
+     && (a)->ino == (b)->ino && (a)->dev == (b)->dev && (a)->size == (b)->size)
 
 /* RewriteRule flags */
 #define HTA_F_LAST            0x0001
@@ -366,8 +416,10 @@ typedef struct {
 
     /* meta */
     time_t            mtime;
+    hta_fver_t        fver;         /* change fingerprint at parse time */
     size_t            mem_size;     /* approximate total pool footprint */
     size_t            regex_bytes;  /* compiled PCRE budget */
+    ngx_uint_t        nregex;       /* compiled patterns in this file */
     ngx_pool_t       *pool;
     /* owner of the directory containing this .htaccess.  AuthUserFile /
      * AuthGroupFile must belong to the same tenant, otherwise one customer
@@ -393,6 +445,7 @@ typedef struct {
     uint32_t          path_hash;    /* FNV-1a for fast comparison */
     hta_parsed_t     *parsed;
     time_t            mtime;
+    hta_fver_t        fver;
     int               wd;
 } hta_cache_t;
 
@@ -407,6 +460,7 @@ typedef struct {
     ngx_flag_t        allow_dangerous_php; /* allow auto_prepend_file etc. */
     ngx_flag_t        allow_security_unset; /* allow unsetting security hdrs */
     ngx_flag_t        symlink_check; /* block request paths escaping root */
+    ngx_array_t      *env_allow;     /* variables SetEnv* may write */
 } ngx_http_hta_loc_conf_t;
 
 typedef struct {
@@ -441,7 +495,20 @@ typedef struct {
     hta_file_list_t files;
     unsigned        collected:1;
     ngx_str_t       root_real;  /* cached realpath(clcf->root) */
+    u_char         *root_conf;  /* the clcf->root it was resolved for */
     unsigned        root_real_set:1;
+    /* regex CPU budget, kept on the main request's context */
+    uint64_t        regex_ns;
+    size_t          expand_bytes;
+    ngx_uint_t      regex_count;
+    unsigned        regex_over:1;
+    unsigned        hdr_failed:1;
+    /* document root opened once per request for file tests (openat2) */
+    int             root_fd;
+    unsigned        root_fd_set:1;
+    /* [E=] assignments, re-applied in the preaccess phase after the
+     * location's own "set" script, as SetEnv is */
+    ngx_array_t    *env_late;
 } hta_req_ctx_t;
 
 
@@ -475,6 +542,7 @@ ngx_int_t hta_location_supported(ngx_http_core_loc_conf_t *clcf);
 ngx_int_t hta_pstrdup(ngx_http_request_t *r, ngx_str_t *dst,
     const ngx_str_t *src);
 ngx_int_t hta_path_inside_root(ngx_http_request_t *r, ngx_str_t *path);
+ngx_int_t hta_root_real(ngx_http_request_t *r, ngx_str_t *out);
 ngx_int_t hta_wildcard_match(u_char *pattern, size_t plen, u_char *name,
     size_t nlen);
 ngx_uint_t hta_tokenize(u_char *line, ngx_uint_t len, u_char **args,
@@ -489,6 +557,19 @@ ngx_uint_t hta_tokenize(u_char *line, ngx_uint_t len, u_char **args,
 ngx_int_t hta_regex_exec(ngx_regex_t *re, ngx_str_t *s, int *captures,
     ngx_uint_t size);
 
+/*
+ * The request whose budget hta_regex_exec charges.  Every entry point of the
+ * module (phase handlers, header filter, variables) sets it for the duration
+ * of its call and restores the previous value; outside of them only the
+ * per-match limits apply.
+ */
+ngx_http_request_t *hta_regex_enter(ngx_http_request_t *r);
+void hta_regex_leave(ngx_http_request_t *prev);
+hta_req_ctx_t *hta_req_ctx(ngx_http_request_t *r);
+uint64_t hta_work_start(void);
+ngx_int_t hta_work_stop(uint64_t t0);
+ngx_int_t hta_work_alloc(size_t n);
+
 /* rewrite.c */
 ngx_int_t hta_expand_vars(ngx_http_request_t *r, ngx_str_t *src,
     ngx_str_t *dst);
@@ -497,6 +578,7 @@ ngx_int_t hta_apply_dirindex(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_apply_redirects(ngx_http_request_t *r, hta_parsed_t *h);
 ngx_int_t hta_apply_fallback(ngx_http_request_t *r, ngx_str_t *fallback);
 ngx_int_t hta_apply_setenvif(ngx_http_request_t *r, hta_parsed_t *h);
+void hta_apply_late_env(ngx_http_request_t *r);
 ngx_int_t hta_check_errdoc(ngx_http_request_t *r, hta_errdoc_t *errdocs,
     ngx_uint_t nerrdocs, ngx_int_t status);
 ngx_int_t hta_protected_security_header(ngx_str_t *name);

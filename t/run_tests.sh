@@ -111,17 +111,17 @@ for f in "${HTDOCS_ROOT}/auth/.htaccess" \
          "${HTDOCS_ROOT}/auth-apr1/.htaccess" \
          "${HTDOCS_ROOT}/groups/.htaccess" \
          "${HTDOCS_ROOT}/sec/inherit/.htaccess" \
-         "${HTDOCS_ROOT}/sec/satisfy-block/.htaccess"; do
+         "${HTDOCS_ROOT}/sec/satisfy-block/.htaccess" \
+         "${HTDOCS_ROOT}/inherit-auth/.htaccess"; do
     [ -f "$f" ] && sed -i "s|__HTDOCS_ROOT__|${HTDOCS_ROOT}|g" "$f"
 done
 
 # Generate {SHA} and $apr1$ htpasswd files for native runs (Docker generates
 # these in the image build step, but native users need them too).
-if command -v sha1sum >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
+if command -v openssl >/dev/null 2>&1; then
     if [ ! -f "${HTDOCS_ROOT}/auth-sha/.htpasswd" ]; then
         mkdir -p "${HTDOCS_ROOT}/auth-sha"
-        SHA_HASH=$(printf '%s' 'testpass' | sha1sum | awk '{print $1}' | \
-                   xxd -r -p | base64)
+        SHA_HASH=$(printf '%s' 'testpass' | openssl dgst -sha1 -binary | base64)
         echo "shauser:{SHA}${SHA_HASH}" > "${HTDOCS_ROOT}/auth-sha/.htpasswd"
     fi
 fi

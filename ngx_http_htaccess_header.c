@@ -296,6 +296,19 @@ hta_header_filter(ngx_http_request_t *r)
     if (r != r->main) return ngx_http_next_header_filter(r);
 
     /*
+     * The regex budget of this request is spent (the response is our own
+     * 500, or a FilesMatch below failed once already): send the response
+     * without .htaccess headers rather than evaluating patterns again.
+     */
+    {
+        hta_req_ctx_t *rctx = ngx_http_get_module_ctx(r,
+                                  ngx_http_htaccess_module);
+        if (rctx != NULL && (rctx->regex_over || rctx->hdr_failed)) {
+            return ngx_http_next_header_filter(r);
+        }
+    }
+
+    /*
      * .htaccess ErrorDocument performs an internal redirect.  The static
      * handler sets 200 for the error page, so restore the original status
      * (Apache serves custom 404/403 pages with the error status).
@@ -523,7 +536,11 @@ hta_header_filter(ngx_http_request_t *r)
                 {
                     ngx_int_t mrc = hta_fb_match(fb, &bname);
                     if (mrc == -1) {
-                        return NGX_ERROR;
+                        hta_req_ctx_t *rctx = hta_req_ctx(r);
+                        if (rctx != NULL) rctx->hdr_failed = 1;
+                        return ngx_http_filter_finalize_request(r,
+                                   &ngx_http_htaccess_module,
+                                   NGX_HTTP_INTERNAL_SERVER_ERROR);
                     }
                     if (!mrc) continue;
                 }

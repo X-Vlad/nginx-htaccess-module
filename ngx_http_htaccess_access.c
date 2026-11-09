@@ -1265,6 +1265,10 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
                                h->owner_uid_valid ? h->owner_uid
                                                   : (uid_t) -1);
         if (fbuf == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "htaccess: AuthUserFile \"%V\" is missing, empty, too large, "
+                "outside the document root or not owned by the site owner, "
+                "failing closed", &h->auth_user_file);
             result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
         }
 
@@ -1354,6 +1358,10 @@ hta_check_auth(ngx_http_request_t *r, hta_parsed_t *h)
                                    h->owner_uid_valid ? h->owner_uid
                                                       : (uid_t) -1);
             if (gbuf == NULL) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "htaccess: AuthGroupFile \"%V\" is missing, empty, too "
+                    "large, outside the document root or not owned by the "
+                    "site owner, failing closed", &h->auth_group_file);
                 result = NGX_HTTP_INTERNAL_SERVER_ERROR; goto done;
             }
 
